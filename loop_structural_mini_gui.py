@@ -2,10 +2,11 @@ import sys
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QFileDialog, QGridLayout,
-    QComboBox, QTextEdit, QFrame, QCheckBox, QListWidget, QInputDialog
+    QComboBox, QTextEdit, QFrame, QCheckBox, QListWidget, QInputDialog,
+    QTableWidget, QTableWidgetItem, QHeaderView, QGroupBox, QMenu
 )
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QDoubleValidator
+from PySide6.QtCore import Qt, Signal, QPoint
+from PySide6.QtGui import QDoubleValidator, QAction
 
 import LoopStructural as LS
 # import LoopStructural.visualisation as vis # No longer used
@@ -13,9 +14,86 @@ import pandas as pd
 import numpy as np
 import pyvista as pv
 from pyvistaqt import QtInteractor # Use QtInteractor for embedding
+# Removed vtk import as PyVista handles it
 
 # Helper for PCA
 from sklearn.decomposition import PCA
+
+def compute_geometric_features(polydata):
+    """
+    Compute geometric features using PyVista's OBB (Oriented Bounding Box).
+    Returns center, axes vectors (normalized), and axes lengths.
+    """
+    if polydata is None or polydata.n_points == 0:
+        # Return default values if polydata is invalid
+        return np.array([0,0,0]), np.array([[1,0,0],[0,1,0],[0,0,1]]), np.array([0,0,0])
+
+    # Use PyVista's obb() method to get OBB attributes
+    # corner, max_corner, mid_corner, axis0, axis1, axis2, side_lengths
+    try:
+        attrs = polydata.obb(return_polydata=False) 
+        center = np.array(attrs[2])      # mid_corner
+        axes = np.array([attrs[3], attrs[4], attrs[5]]) # axis0, axis1, axis2
+        lengths = np.array(attrs[6])     # side_lengths
+    except Exception as e:
+        print(f"Error computing OBB: {e}. Falling back to PCA-like method.") # Log for debugging
+        # Fallback to a PCA-like method if OBB fails (e.g., for very few points like 1 or 2)
+        points = polydata.points
+        center = np.mean(points, axis=0)
+        if polydata.n_points <= 1: # Not enough points for covariance
+             return center, np.identity(3), np.zeros(3)
+
+        centered_points = points - center
+        if polydata.n_points == 2: # Special handling for 2 points (a line)
+            vec = centered_points[1] - centered_points[0]
+            length1 = np.linalg.norm(vec)
+            axis1 = vec / length1 if length1 > 1e-6 else np.array([1,0,0])
+            # Create two orthogonal axes
+            temp_axis = np.array([0,0,1]) if np.abs(np.dot(axis1, np.array([0,0,1]))) < 0.9 else np.array([0,1,0])
+            axis2 = np.cross(axis1, temp_axis)
+            axis2_norm = np.linalg.norm(axis2)
+            if axis2_norm > 1e-6: axis2 /= axis2_norm
+            else: axis2 = np.array([0,1,0] if axis1[0]!=0 or axis1[2]!=0 else [1,0,0]) # Ensure orthogonality
+            
+            axis3 = np.cross(axis1, axis2)
+            axis3_norm = np.linalg.norm(axis3)
+            if axis3_norm > 1e-6: axis3 /= axis3_norm
+            # Re-orthogonalize axis2 if necessary from axis1 and axis3
+            axis2 = np.cross(axis3, axis1)
+            return center, np.array([axis1, axis2, axis3]), np.array([length1, 0, 0])
+
+        cov_matrix = np.cov(centered_points.T)
+        eigenvalues, eigenvectors_cols = np.linalg.eigh(cov_matrix)
+        
+        # Sort by eigenvalues in descending order
+        sort_idx = np.argsort(eigenvalues)[::-1]
+        # eigenvalues = eigenvalues[sort_idx] # Not directly used for lengths anymore
+        axes = eigenvectors_cols[:, sort_idx].T # Transpose to get axes as rows
+        
+        # Compute lengths based on point cloud extents along these axes
+        projected_coords = centered_points @ axes.T
+        lengths = np.ptp(projected_coords, axis=0)
+
+    # Ensure axes are normalized (vtkOBBTree axes might not be, though lengths are given)
+    for i in range(3):
+        norm = np.linalg.norm(axes[i])
+        if norm > 1e-6:
+            axes[i] /= norm
+        else: # If an axis is zero (e.g. flat data), set a default
+            default_axes = np.identity(3)
+            axes[i] = default_axes[i]
+
+    # Sort axes by length (descending) as OBB might not guarantee this order strictly
+    # or if we fell back to PCA where eigenvalues determine order, but lengths from ptp might differ.
+    sort_idx = np.argsort(lengths)[::-1]
+    axes = axes[sort_idx]
+    lengths = lengths[sort_idx]
+    
+    # Ensure right-handed coordinate system
+    if np.dot(np.cross(axes[0], axes[1]), axes[2]) < 0:
+        axes[2] = -axes[2] # Flip the smallest axis to maintain right-handedness
+    
+    return center, axes, lengths
 
 class PyVistaPlotterWidget(QFrame):
     def __init__(self, parent=None):
@@ -34,37 +112,26 @@ class LoopStructuralMiniGui(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("LoopStructural Mini GUI with PyVista")
-        self.setGeometry(100, 100, 1200, 800) # Wider for plotter
+        self.setGeometry(100, 100, 1400, 900) # Wider for plotter and table
 
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         
-        # Main layout: controls on left, plotter on right
         self.main_h_layout = QHBoxLayout(self.central_widget)
         
         self.controls_widget = QWidget()
         self.controls_layout = QVBoxLayout(self.controls_widget)
-        self.main_h_layout.addWidget(self.controls_widget, 1) # Controls take 1/3 space
+        self.main_h_layout.addWidget(self.controls_widget, 1) 
 
         self.pyvista_widget = PyVistaPlotterWidget(self)
-        self.main_h_layout.addWidget(self.pyvista_widget, 2) # Plotter takes 2/3 space
+        self.main_h_layout.addWidget(self.pyvista_widget, 2) 
 
         self.model_data_df = None
         self.geological_model = None
         self.strati_polydata = None # Stratigraphy remains singular for now
-
-        # New structure for multiple faults
-        # Key: fault_name (str)
-        # Value: dict with keys:
-        #   'polydata': pv.PolyData,
-        #   'is_planar_fit': bool,
-        #   'pca_center', 'pca_components', 'pca_extents': np.array (if PCA),
-        #   'plane_center', 'plane_normal', 'in_plane_axes_vectors', 
-        #   'in_plane_axes_lengths', 'planar_minor_axis_length': (if Planar Fit)
-        #   'gui_center_x', 'gui_center_y', 'gui_center_z', 
-        #   'gui_major_axis', 'gui_minor_axis', 'gui_intermediate_axis': str (values from GUI text fields for this fault)
         self.faults_data = {}
         self.current_fault_name = None
+        self.fault_relationships = {} # To store {(fault1, fault2): type}
 
         self.double_validator = QDoubleValidator() # For float inputs
 
@@ -79,19 +146,22 @@ class LoopStructuralMiniGui(QMainWindow):
         self.log_status("GUI Initialized. Please load data and set parameters.")
 
     def _create_input_widgets(self):
-        grid_layout = QGridLayout()
-        grid_layout.setSpacing(10)
+        # Main grid for parameters
+        param_grid_layout = QGridLayout()
+        param_grid_layout.setSpacing(10)
         current_row = 0
 
         # Fault List
-        grid_layout.addWidget(QLabel("<b>Loaded Faults:</b>"), current_row, 0, 1, 2)
+        param_grid_layout.addWidget(QLabel("<b>Loaded Faults:</b>"), current_row, 0, 1, 2)
         self.fault_list_widget = QListWidget()
         self.fault_list_widget.setFixedHeight(100)
         self.fault_list_widget.currentItemChanged.connect(self.on_fault_selection_changed)
-        grid_layout.addWidget(self.fault_list_widget, current_row + 1, 0, 1, 2); current_row += 2 # Span 2 rows for label and list
+        self.fault_list_widget.setContextMenuPolicy(Qt.CustomContextMenu) # Enable context menu
+        self.fault_list_widget.customContextMenuRequested.connect(self._show_fault_list_context_menu) # Connect handler
+        param_grid_layout.addWidget(self.fault_list_widget, current_row + 1, 0, 1, 2); current_row += 2
         
         # Origin
-        grid_layout.addWidget(QLabel("<b>Model Origin (X,Y,Z):</b>"), current_row, 0, 1, 4); current_row += 1
+        param_grid_layout.addWidget(QLabel("<b>Model Origin (X,Y,Z):</b>"), current_row, 0, 1, 4); current_row += 1
         self.origin_x_edit = QLineEdit("0"); self.origin_x_edit.setValidator(self.double_validator)
         self.origin_y_edit = QLineEdit("0"); self.origin_y_edit.setValidator(self.double_validator)
         self.origin_z_edit = QLineEdit("0"); self.origin_z_edit.setValidator(self.double_validator)
@@ -99,85 +169,204 @@ class LoopStructuralMiniGui(QMainWindow):
         origin_layout.addWidget(QLabel("X:")); origin_layout.addWidget(self.origin_x_edit)
         origin_layout.addWidget(QLabel("Y:")); origin_layout.addWidget(self.origin_y_edit)
         origin_layout.addWidget(QLabel("Z:")); origin_layout.addWidget(self.origin_z_edit)
-        grid_layout.addLayout(origin_layout, current_row, 0, 1, 4); current_row += 1
+        param_grid_layout.addLayout(origin_layout, current_row, 0, 1, 4); current_row += 1
         
         # Extent / Maximum
-        grid_layout.addWidget(QLabel("<b>Model Maximum (X,Y,Z):</b>"), current_row, 0, 1, 4); current_row += 1
-        self.max_x_edit = QLineEdit("1000"); self.max_x_edit.setValidator(self.double_validator) # Larger default for VTK data
+        param_grid_layout.addWidget(QLabel("<b>Model Maximum (X,Y,Z):</b>"), current_row, 0, 1, 4); current_row += 1
+        self.max_x_edit = QLineEdit("1000"); self.max_x_edit.setValidator(self.double_validator)
         self.max_y_edit = QLineEdit("1000"); self.max_y_edit.setValidator(self.double_validator)
         self.max_z_edit = QLineEdit("1000"); self.max_z_edit.setValidator(self.double_validator)
         max_layout = QHBoxLayout()
         max_layout.addWidget(QLabel("X:")); max_layout.addWidget(self.max_x_edit)
         max_layout.addWidget(QLabel("Y:")); max_layout.addWidget(self.max_y_edit)
         max_layout.addWidget(QLabel("Z:")); max_layout.addWidget(self.max_z_edit)
-        grid_layout.addLayout(max_layout, current_row, 0, 1, 4); current_row += 1
+        param_grid_layout.addLayout(max_layout, current_row, 0, 1, 4); current_row += 1
 
         # Fault Parameters
-        grid_layout.addWidget(QLabel("<b>--- Fault Parameters ---</b>"), current_row, 0, 1, 4, Qt.AlignCenter); current_row += 1
+        param_grid_layout.addWidget(QLabel("<b>--- Fault Parameters ---</b>"), current_row, 0, 1, 4, Qt.AlignCenter); current_row += 1
         
+        override_layout = QHBoxLayout() # Layout for checkbox and reset button
         self.override_fault_geom_checkbox = QCheckBox("Override Calculated Fault Geometry")
         self.override_fault_geom_checkbox.setChecked(False)
         self.override_fault_geom_checkbox.stateChanged.connect(self.toggle_fault_geom_fields)
-        grid_layout.addWidget(self.override_fault_geom_checkbox, current_row, 0, 1, 4); current_row += 1
+        override_layout.addWidget(self.override_fault_geom_checkbox)
 
-        grid_layout.addWidget(QLabel("Fault Center (X,Y,Z):"), current_row, 0, 1, 1)
+        self.reset_geom_button = QPushButton("Reset Geometry to Calculated")
+        self.reset_geom_button.clicked.connect(self._on_reset_geometry_clicked)
+        self.reset_geom_button.setEnabled(False) # Initially disabled
+        override_layout.addWidget(self.reset_geom_button)
+        param_grid_layout.addLayout(override_layout, current_row, 0, 1, 4); current_row += 1
+
+        param_grid_layout.addWidget(QLabel("Fault Center (X,Y,Z):"), current_row, 0, 1, 1)
         self.fault_center_x_edit = QLineEdit(); self.fault_center_x_edit.setReadOnly(True); self.fault_center_x_edit.setValidator(self.double_validator)
         self.fault_center_y_edit = QLineEdit(); self.fault_center_y_edit.setReadOnly(True); self.fault_center_y_edit.setValidator(self.double_validator)
         self.fault_center_z_edit = QLineEdit(); self.fault_center_z_edit.setReadOnly(True); self.fault_center_z_edit.setValidator(self.double_validator)
+        self.fault_center_x_edit.editingFinished.connect(self.on_manual_fault_geom_changed)
+        self.fault_center_y_edit.editingFinished.connect(self.on_manual_fault_geom_changed)
+        self.fault_center_z_edit.editingFinished.connect(self.on_manual_fault_geom_changed)
         fault_center_layout = QHBoxLayout()
         fault_center_layout.addWidget(QLabel("X:")); fault_center_layout.addWidget(self.fault_center_x_edit)
         fault_center_layout.addWidget(QLabel("Y:")); fault_center_layout.addWidget(self.fault_center_y_edit)
         fault_center_layout.addWidget(QLabel("Z:")); fault_center_layout.addWidget(self.fault_center_z_edit)
-        grid_layout.addLayout(fault_center_layout, current_row, 1, 1, 3); current_row += 1
+        param_grid_layout.addLayout(fault_center_layout, current_row, 1, 1, 3); current_row += 1
         
-        grid_layout.addWidget(QLabel("Major Axis Length:"), current_row, 0)
+        param_grid_layout.addWidget(QLabel("Major Axis Length:"), current_row, 0)
         self.fault_major_axis_edit = QLineEdit(); self.fault_major_axis_edit.setReadOnly(True); self.fault_major_axis_edit.setValidator(self.double_validator)
-        grid_layout.addWidget(self.fault_major_axis_edit, current_row, 1)
-        grid_layout.addWidget(QLabel("Minor Axis Length:"), current_row, 2)
+        self.fault_major_axis_edit.editingFinished.connect(self.on_manual_fault_geom_changed)
+        param_grid_layout.addWidget(self.fault_major_axis_edit, current_row, 1)
+        param_grid_layout.addWidget(QLabel("Minor Axis Length:"), current_row, 2)
         self.fault_minor_axis_edit = QLineEdit(); self.fault_minor_axis_edit.setReadOnly(True); self.fault_minor_axis_edit.setValidator(self.double_validator)
-        grid_layout.addWidget(self.fault_minor_axis_edit, current_row, 3); current_row += 1
+        self.fault_minor_axis_edit.editingFinished.connect(self.on_manual_fault_geom_changed)
+        param_grid_layout.addWidget(self.fault_minor_axis_edit, current_row, 3); current_row += 1
         
-        grid_layout.addWidget(QLabel("Intermediate Axis Length:"), current_row, 0)
-        self.fault_intermediate_axis_edit = QLineEdit("10"); self.fault_intermediate_axis_edit.setValidator(self.double_validator) # Remains manual/default
-        grid_layout.addWidget(self.fault_intermediate_axis_edit, current_row, 1); current_row += 1
+        param_grid_layout.addWidget(QLabel("Intermediate Axis Length:"), current_row, 0)
+        self.fault_intermediate_axis_edit = QLineEdit("10"); self.fault_intermediate_axis_edit.setReadOnly(True); self.fault_intermediate_axis_edit.setValidator(self.double_validator)
+        self.fault_intermediate_axis_edit.editingFinished.connect(self.on_manual_fault_geom_changed)
+        param_grid_layout.addWidget(self.fault_intermediate_axis_edit, current_row, 1); current_row += 1
 
-
-        grid_layout.addWidget(QLabel("Displacement:"), current_row, 0)
+        param_grid_layout.addWidget(QLabel("Displacement:"), current_row, 0)
         self.fault_displacement_edit = QLineEdit("1"); self.fault_displacement_edit.setValidator(self.double_validator)
-        grid_layout.addWidget(self.fault_displacement_edit, current_row, 1)
-        grid_layout.addWidget(QLabel("Nelements:"), current_row, 2)
-        self.fault_nelements_edit = QLineEdit("1000"); self.fault_nelements_edit.setValidator(QDoubleValidator(0, 1000000, 0)) # Integer
-        grid_layout.addWidget(self.fault_nelements_edit, current_row, 3); current_row +=1
+        self.fault_displacement_edit.editingFinished.connect(self.on_fault_parameter_changed)
+        param_grid_layout.addWidget(self.fault_displacement_edit, current_row, 1)
+        param_grid_layout.addWidget(QLabel("Nelements:"), current_row, 2)
+        self.fault_nelements_edit = QLineEdit("1000"); self.fault_nelements_edit.setValidator(QDoubleValidator(0, 1000000, 0))
+        self.fault_nelements_edit.editingFinished.connect(self.on_fault_parameter_changed)
+        param_grid_layout.addWidget(self.fault_nelements_edit, current_row, 3); current_row +=1
 
-        grid_layout.addWidget(QLabel("Interpolator Type:"), current_row, 0)
+        param_grid_layout.addWidget(QLabel("Interpolator Type:"), current_row, 0)
         self.fault_interpolator_combo = QComboBox(); self.fault_interpolator_combo.addItems(["PLI", "FDI", "Surfe"])
-        grid_layout.addWidget(self.fault_interpolator_combo, current_row, 1)
-        grid_layout.addWidget(QLabel("Fault Buffer:"), current_row, 2)
+        self.fault_interpolator_combo.currentTextChanged.connect(self.on_fault_parameter_changed)
+        param_grid_layout.addWidget(self.fault_interpolator_combo, current_row, 1)
+        param_grid_layout.addWidget(QLabel("Fault Buffer:"), current_row, 2)
         self.fault_buffer_edit = QLineEdit("0.5"); self.fault_buffer_edit.setValidator(self.double_validator)
-        grid_layout.addWidget(self.fault_buffer_edit, current_row, 3); current_row +=1
+        self.fault_buffer_edit.editingFinished.connect(self.on_fault_parameter_changed)
+        param_grid_layout.addWidget(self.fault_buffer_edit, current_row, 3); current_row +=1
         
         # Foliation Parameters
-        grid_layout.addWidget(QLabel("<b>--- Foliation Parameters ('strati') ---</b>"), current_row, 0, 1, 4, Qt.AlignCenter); current_row +=1
-        grid_layout.addWidget(QLabel("Nelements:"), current_row, 0)
+        param_grid_layout.addWidget(QLabel("<b>--- Foliation Parameters ('strati') ---</b>"), current_row, 0, 1, 4, Qt.AlignCenter); current_row +=1
+        param_grid_layout.addWidget(QLabel("Nelements:"), current_row, 0)
         self.foliation_nelements_edit = QLineEdit("1000"); self.foliation_nelements_edit.setValidator(QDoubleValidator(0,1000000,0))
-        grid_layout.addWidget(self.foliation_nelements_edit, current_row, 1)
-        grid_layout.addWidget(QLabel("Interpolator Type:"), current_row, 2)
+        param_grid_layout.addWidget(self.foliation_nelements_edit, current_row, 1)
+        param_grid_layout.addWidget(QLabel("Interpolator Type:"), current_row, 2)
         self.foliation_interpolator_combo = QComboBox(); self.foliation_interpolator_combo.addItems(["PLI", "FDI", "Surfe"])
-        grid_layout.addWidget(self.foliation_interpolator_combo, current_row, 3); current_row +=1
+        param_grid_layout.addWidget(self.foliation_interpolator_combo, current_row, 3); current_row +=1
+
+        self.controls_layout.addLayout(param_grid_layout) # Add the grid of parameters
+
+        # Fault Relationships Table
+        self.relationship_group_box = QGroupBox("Fault Relationships")
+        self.relationship_layout = QVBoxLayout()
+        self.relationship_table = QTableWidget()
+        self.relationship_table.setMinimumHeight(150) # Give it some initial height
+        self.relationship_layout.addWidget(self.relationship_table)
+        self.relationship_group_box.setLayout(self.relationship_layout)
+        self.controls_layout.addWidget(self.relationship_group_box)
+        self._update_relationship_table() # Initial call to set up empty table
+
+    def _show_fault_list_context_menu(self, position: QPoint):
+        item = self.fault_list_widget.itemAt(position)
+        if not item:
+            return
+
+        fault_name = item.text()
+        menu = QMenu()
+        zoom_action = QAction(f"Zoom to Fault: {fault_name}", self)
+        zoom_action.triggered.connect(lambda: self._zoom_to_selected_fault(fault_name))
+        menu.addAction(zoom_action)
+        menu.exec(self.fault_list_widget.mapToGlobal(position))
+
+    def _zoom_to_selected_fault(self, fault_name):
+        if fault_name not in self.faults_data:
+            self.log_status(f"Cannot zoom: Fault data for '{fault_name}' not found.")
+            return
+
+        fault_data = self.faults_data[fault_name]
+        plotter = self.pyvista_widget.plotter
+
+        center = fault_data.get('center')
+        axes_vectors = fault_data.get('axes')
+        lengths = fault_data.get('lengths')
+
+        if center is None or axes_vectors is None or lengths is None:
+            self.log_status(f"Geometric data missing for fault '{fault_name}'. Cannot calculate zoom bounds.")
+            # Fallback to polydata bounds if geometry is incomplete
+            if fault_data.get('polydata'):
+                plotter.reset_camera(bounds=fault_data['polydata'].bounds)
+                self.log_status(f"Zoomed to polydata bounds of fault '{fault_name}'.")
+            return
+
+        points_for_bounds = [center.copy()]
+        for i in range(3):
+            vec = axes_vectors[i]
+            length = lengths[i]
+            # Ensure length is positive for visualization bounds
+            vis_length = max(length, np.mean(lengths) * 0.01 if np.mean(lengths) > 0 else 0.1) 
+            if vis_length <=0 : vis_length = 0.1 # ensure positive
+            
+            p_a = center - vec * (vis_length / 2.0)
+            p_b = center + vec * (vis_length / 2.0)
+            points_for_bounds.append(p_a)
+            points_for_bounds.append(p_b)
         
-        self.controls_layout.addLayout(grid_layout)
+        bounds_mesh = pv.PolyData(np.array(points_for_bounds))
+        if bounds_mesh.n_points > 0:
+            plotter.reset_camera(bounds=bounds_mesh.bounds)
+            self.log_status(f"Zoomed to fault '{fault_name}'.")
+        else:
+            self.log_status(f"Could not determine valid bounds for fault '{fault_name}' to zoom.")
+
+    def _on_reset_geometry_clicked(self):
+        if not self.current_fault_name or not self.override_fault_geom_checkbox.isChecked():
+            self.log_status("Select a fault and enable 'Override Calculated Fault Geometry' to reset.")
+            return
+
+        fault_data = self.faults_data.get(self.current_fault_name)
+        if not fault_data:
+            return
+
+        if 'initial_center' not in fault_data or 'initial_lengths' not in fault_data:
+            self.log_status(f"No initial calculated geometry stored for fault '{self.current_fault_name}'. Cannot reset.")
+            return
+
+        # Restore from initial_... values
+        fault_data['center'] = fault_data['initial_center'].copy()
+        fault_data['lengths'] = fault_data['initial_lengths'].copy()
+        # Axes (orientation) are from initial_axes and not changed by this override system for now
+        # If axes were also overridable, we'd reset fault_data['axes'] = fault_data['initial_axes'].copy()
+
+        # Update GUI string representations from the now reset numerical values
+        fault_data['gui_center_x'] = f"{fault_data['center'][0]:.2f}"
+        fault_data['gui_center_y'] = f"{fault_data['center'][1]:.2f}"
+        fault_data['gui_center_z'] = f"{fault_data['center'][2]:.2f}"
+        fault_data['gui_major_axis'] = f"{fault_data['lengths'][0]:.2f}"
+        fault_data['gui_intermediate_axis'] = f"{fault_data['lengths'][1]:.2f}"
+        fault_data['gui_minor_axis'] = f"{fault_data['lengths'][2]:.2f}"
+        
+        self.update_fault_gui_fields(self.current_fault_name) # Refresh QLineEdits
+        self.log_status(f"Geometry for fault '{self.current_fault_name}' reset to calculated values.")
+        
+        # Trigger visualization update (similar to on_manual_fault_geom_changed)
+        self.pyvista_widget.plotter.clear_actors()
+        for name, data in self.faults_data.items():
+            if data.get('polydata'):
+                style_args = {'style':'wireframe', 'color':'darkgrey', 'line_width':2, 'name':f"fault_input_{name}"}
+                if data['polydata'].n_points <= 10:
+                    style_args = {'style':'points', 'color':'magenta', 'point_size':15, 'name':f"fault_input_points_few_{name}"}
+                    self.pyvista_widget.plotter.add_mesh(data['polydata'].outline(), color='cyan', name=f"fault_input_bbox_{name}")
+                self.pyvista_widget.plotter.add_mesh(data['polydata'], **style_args)
+        if self.strati_polydata:
+            self.pyvista_widget.plotter.add_mesh(self.strati_polydata, style='points', color='blue', point_size=5, name="strati_input_vtk_points")
+        self._add_fault_axes_widget(self.pyvista_widget.plotter)
+        self.pyvista_widget.plotter.render()
 
     def on_fault_selection_changed(self, current_item, previous_item):
         if current_item is not None:
             self.current_fault_name = current_item.text()
             self.log_status(f"Selected fault: {self.current_fault_name}")
-            self.update_fault_gui_fields(self.current_fault_name)
-            # Trigger a plotter update to potentially highlight or focus on this fault's axes
-            # For now, _add_fault_axes_widget will draw all, so an explicit call might not be needed yet
-            # unless we want highlighting.
+            self.update_fault_gui_fields(self.current_fault_name) # This will also update reset_geom_button state
+            # Visualization update for selection (highlighting, etc.)
             if self.faults_data.get(self.current_fault_name, {}).get('polydata'):
-                self.pyvista_widget.plotter.clear() # Clear plotter before redrawing, might need refinement
-                # Re-add all fault meshes
+                self.pyvista_widget.plotter.clear_actors() 
                 for name, data in self.faults_data.items():
                     if data.get('polydata'):
                         style_args = {'style':'wireframe', 'color':'darkgrey', 'line_width':2, 'name':f"fault_input_{name}"}
@@ -185,46 +374,156 @@ class LoopStructuralMiniGui(QMainWindow):
                             style_args = {'style':'points', 'color':'magenta', 'point_size':15, 'name':f"fault_input_points_few_{name}"}
                             self.pyvista_widget.plotter.add_mesh(data['polydata'].outline(), color='cyan', name=f"fault_input_bbox_{name}")
                         self.pyvista_widget.plotter.add_mesh(data['polydata'], **style_args)
-                # Re-add strati if exists
                 if self.strati_polydata:
                     self.pyvista_widget.plotter.add_mesh(self.strati_polydata, style='points', color='blue', point_size=5, name="strati_input_vtk_points")
-                self._add_fault_axes_widget(self.pyvista_widget.plotter)
+                self._add_fault_axes_widget(self.pyvista_widget.plotter) # This will draw axes for current fault differently if logic is there
                 self.pyvista_widget.plotter.reset_camera()
-
         else:
             self.current_fault_name = None
-            # Clear fault-specific GUI fields if no fault is selected
-            self.fault_center_x_edit.clear(); self.fault_center_y_edit.clear(); self.fault_center_z_edit.clear()
-            self.fault_major_axis_edit.clear(); self.fault_minor_axis_edit.clear(); self.fault_intermediate_axis_edit.clear()
+            self.update_fault_gui_fields(None) # Clear fields and disable reset button
 
     def update_fault_gui_fields(self, fault_name):
         fault_data = self.faults_data.get(fault_name)
         if fault_data:
+            # Geometric params
             self.fault_center_x_edit.setText(fault_data.get('gui_center_x', ""))
             self.fault_center_y_edit.setText(fault_data.get('gui_center_y', ""))
             self.fault_center_z_edit.setText(fault_data.get('gui_center_z', ""))
             self.fault_major_axis_edit.setText(fault_data.get('gui_major_axis', ""))
+            self.fault_intermediate_axis_edit.setText(fault_data.get('gui_intermediate_axis', "0")) # Default if missing
             self.fault_minor_axis_edit.setText(fault_data.get('gui_minor_axis', ""))
-            self.fault_intermediate_axis_edit.setText(fault_data.get('gui_intermediate_axis', ""))
-            # Read-only status based on override checkbox and if data exists
-            is_editable = self.override_fault_geom_checkbox.isChecked()
-            self.fault_center_x_edit.setReadOnly(not is_editable or not fault_data.get('gui_center_x'))
-            self.fault_center_y_edit.setReadOnly(not is_editable or not fault_data.get('gui_center_y'))
-            self.fault_center_z_edit.setReadOnly(not is_editable or not fault_data.get('gui_center_z'))
-            self.fault_major_axis_edit.setReadOnly(not is_editable or not fault_data.get('gui_major_axis'))
-            self.fault_minor_axis_edit.setReadOnly(not is_editable or not fault_data.get('gui_minor_axis'))
-            # self.fault_intermediate_axis_edit is currently always editable for its default value if no calc value
+            
+            # Non-geometric fault parameters
+            self.fault_displacement_edit.setText(fault_data.get('gui_displacement', "1"))
+            self.fault_nelements_edit.setText(fault_data.get('gui_nelements', "1000"))
+            self.fault_interpolator_combo.setCurrentText(fault_data.get('gui_interpolator_type', "PLI"))
+            self.fault_buffer_edit.setText(fault_data.get('gui_fault_buffer', "0.5"))
+
+            is_overriding = self.override_fault_geom_checkbox.isChecked()
+            self.fault_center_x_edit.setReadOnly(not is_overriding)
+            self.fault_center_y_edit.setReadOnly(not is_overriding)
+            self.fault_center_z_edit.setReadOnly(not is_overriding)
+            self.fault_major_axis_edit.setReadOnly(not is_overriding)
+            self.fault_intermediate_axis_edit.setReadOnly(not is_overriding)
+            self.fault_minor_axis_edit.setReadOnly(not is_overriding)
+            self.reset_geom_button.setEnabled(is_overriding) # Enable/disable reset button
+
+        else: # No fault selected or fault_data not found
+            self.fault_center_x_edit.clear(); self.fault_center_y_edit.clear(); self.fault_center_z_edit.clear()
+            self.fault_major_axis_edit.clear(); self.fault_minor_axis_edit.clear(); self.fault_intermediate_axis_edit.clear()
+            # Clear other fault-specific fields
+            self.fault_displacement_edit.setText("1")
+            self.fault_nelements_edit.setText("1000")
+            self.fault_interpolator_combo.setCurrentText("PLI")
+            self.fault_buffer_edit.setText("0.5")
+            self.reset_geom_button.setEnabled(False)
 
     def toggle_fault_geom_fields(self, state):
         is_editable = (state == Qt.Checked)
-        self.fault_center_x_edit.setReadOnly(not is_editable)
-        self.fault_center_y_edit.setReadOnly(not is_editable)
-        self.fault_center_z_edit.setReadOnly(not is_editable)
-        self.fault_major_axis_edit.setReadOnly(not is_editable)
-        self.fault_minor_axis_edit.setReadOnly(not is_editable)
-        # Intermediate axis is always editable for now
-        # self.fault_intermediate_axis_edit.setReadOnly(not is_editable)
+        self.reset_geom_button.setEnabled(is_editable and self.current_fault_name is not None) # Also check if a fault is selected
 
+        if self.current_fault_name:
+            self.update_fault_gui_fields(self.current_fault_name) # This will set read-only based on checkbox
+        else: # No fault selected, just toggle general state
+            self.fault_center_x_edit.setReadOnly(not is_editable)
+            self.fault_center_y_edit.setReadOnly(not is_editable)
+            self.fault_center_z_edit.setReadOnly(not is_editable)
+            self.fault_major_axis_edit.setReadOnly(not is_editable)
+            self.fault_intermediate_axis_edit.setReadOnly(not is_editable)
+            self.fault_minor_axis_edit.setReadOnly(not is_editable)
+    
+    def on_manual_fault_geom_changed(self):
+        if not self.override_fault_geom_checkbox.isChecked() or not self.current_fault_name:
+            return
+
+        fault_data = self.faults_data.get(self.current_fault_name)
+        if not fault_data:
+            return
+
+        try:
+            # Update GUI string representations first
+            fault_data['gui_center_x'] = self.fault_center_x_edit.text()
+            fault_data['gui_center_y'] = self.fault_center_y_edit.text()
+            fault_data['gui_center_z'] = self.fault_center_z_edit.text()
+            fault_data['gui_major_axis'] = self.fault_major_axis_edit.text()
+            fault_data['gui_intermediate_axis'] = self.fault_intermediate_axis_edit.text()
+            fault_data['gui_minor_axis'] = self.fault_minor_axis_edit.text()
+
+            # Update numerical data for visualization
+            new_center_x = float(self.fault_center_x_edit.text())
+            new_center_y = float(self.fault_center_y_edit.text())
+            new_center_z = float(self.fault_center_z_edit.text())
+            fault_data['center'] = np.array([new_center_x, new_center_y, new_center_z])
+
+            new_major_len = float(self.fault_major_axis_edit.text())
+            new_inter_len = float(self.fault_intermediate_axis_edit.text())
+            new_minor_len = float(self.fault_minor_axis_edit.text())
+            
+            # Ensure lengths are in the correct order (Major, Intermediate, Minor)
+            # The 'axes' vectors are assumed to be already sorted this way from calculation.
+            # If lengths were re-ordered by user, this might not perfectly match original axes meaning,
+            # but for visualization, we apply lengths as given.
+            fault_data['lengths'] = np.array([new_major_len, new_inter_len, new_minor_len])
+
+            self.log_status(f"Fault '{self.current_fault_name}' geometry overridden by GUI values.")
+            
+            # Refresh visualization
+            # Clear previous input data display before redrawing axes and points
+            self.pyvista_widget.plotter.clear_actors() # More specific than clear() if other things are on plotter
+
+            # Re-add all fault meshes (dots/wireframes)
+            for name, data in self.faults_data.items():
+                if data.get('polydata'):
+                    style_args = {'style':'wireframe', 'color':'darkgrey', 'line_width':2, 'name':f"fault_input_{name}"}
+                    if data['polydata'].n_points <= 10:
+                        style_args = {'style':'points', 'color':'magenta', 'point_size':15, 'name':f"fault_input_points_few_{name}"}
+                        self.pyvista_widget.plotter.add_mesh(data['polydata'].outline(), color='cyan', name=f"fault_input_bbox_{name}")
+                    self.pyvista_widget.plotter.add_mesh(data['polydata'], **style_args)
+            
+            # Re-add strati if exists
+            if self.strati_polydata:
+                self.pyvista_widget.plotter.add_mesh(self.strati_polydata, style='points', color='blue', point_size=5, name="strati_input_vtk_points")
+
+            self._add_fault_axes_widget(self.pyvista_widget.plotter)
+            self.pyvista_widget.plotter.render() # Update the render window immediately
+
+        except ValueError:
+            self.log_status("ERROR: Invalid number in fault geometry field during override.")
+        except Exception as e:
+            self.log_status(f"ERROR during manual fault geometry update: {e}")
+            import traceback
+            self.log_status(traceback.format_exc())
+
+    def on_fault_parameter_changed(self):
+        if not self.current_fault_name:
+            return
+
+        fault_data = self.faults_data.get(self.current_fault_name)
+        if not fault_data:
+            return
+        
+        try:
+            # Update string representations in fault_data from GUI
+            fault_data['gui_displacement'] = self.fault_displacement_edit.text()
+            fault_data['gui_nelements'] = self.fault_nelements_edit.text()
+            fault_data['gui_interpolator_type'] = self.fault_interpolator_combo.currentText()
+            fault_data['gui_fault_buffer'] = self.fault_buffer_edit.text()
+            
+            # Log the change. No direct visualization update is tied to these specific parameters.
+            # Find out which widget sent the signal for a more specific log message (optional)
+            sender = self.sender()
+            param_name = "Unknown"
+            if sender == self.fault_displacement_edit: param_name = "Displacement"
+            elif sender == self.fault_nelements_edit: param_name = "Nelements"
+            elif sender == self.fault_interpolator_combo: param_name = "Interpolator Type"
+            elif sender == self.fault_buffer_edit: param_name = "Fault Buffer"
+
+            self.log_status(f"Fault '{self.current_fault_name}' parameter '{param_name}' updated in GUI.")
+
+        except Exception as e:
+            self.log_status(f"ERROR during fault parameter update: {e}")
+            import traceback
+            self.log_status(traceback.format_exc())
 
     def _create_control_buttons(self):
         data_load_layout = QHBoxLayout()
@@ -270,91 +569,48 @@ class LoopStructuralMiniGui(QMainWindow):
         except ValueError: self.log_status(f"ERROR: Invalid int for {name}. Using default {default_val}."); return default_val
 
     def _add_fault_axes_widget(self, plotter):
-        # Clear all actors that might have been added by this method previously using specific prefixes
-        actors_to_remove = []
-        for actor in plotter.renderer.actors.keys():
-            if actor.startswith("FAULTAXIS_"):
-                actors_to_remove.append(actor)
+        # Clear existing axes
+        actors_to_remove = [actor for actor in plotter.renderer.actors.keys() if actor.startswith("FAULTAXIS_")]
         for actor_name in actors_to_remove:
-            plotter.remove_actor(actor_name, render=False) # Batch removal, render at end if needed
+            plotter.remove_actor(actor_name, render=False)
 
         legend_entries = []
 
         for fault_name, fault_data in self.faults_data.items():
-            if fault_data.get('is_planar_fit'):
-                if fault_data.get('plane_center') is not None and fault_data.get('plane_normal') is not None and \
-                   fault_data.get('in_plane_axes_vectors') is not None and fault_data.get('in_plane_axes_lengths') is not None:
+            if 'center' in fault_data and 'axes' in fault_data and 'lengths' in fault_data:
+                center = fault_data['center']
+                axes = fault_data['axes']
+                lengths = fault_data['lengths']
+
+                colors = ['red', 'green', 'blue']
+                labels = ['Major', 'Intermediate', 'Minor']
+
+                # Draw axes
+                for i, (axis, length, color, label) in enumerate(zip(axes, lengths, colors, labels)):
+                    # Ensure minimum visible length
+                    vis_length = max(length, np.mean(lengths) * 0.1)
+                    p_a = center - axis * (vis_length/2)
+                    p_b = center + axis * (vis_length/2)
+                    plotter.add_mesh(pv.Line(p_a, p_b), color=color, line_width=3, 
+                                   name=f"FAULTAXIS_{fault_name}_{label}")
                     
-                    center = fault_data['plane_center']
-                    normal_vec = fault_data['plane_normal']
-                    in_plane_vecs = fault_data['in_plane_axes_vectors']
-                    in_plane_lengths = fault_data['in_plane_axes_lengths']
-                    minor_axis_len = fault_data.get('planar_minor_axis_length', 0.1)
+                    if fault_name == self.current_fault_name or len(self.faults_data) == 1:
+                        legend_entries.append((f"{fault_name} {label}", color))
 
-                    # In-Plane Major Axis (Red)
-                    if len(in_plane_vecs) > 0 and len(in_plane_lengths) > 0:
-                        axis1_vec, axis1_len = in_plane_vecs[0], in_plane_lengths[0]
-                        if axis1_len < 0.01 : axis1_len = 0.1
-                        p_a, p_b = center - axis1_vec * (axis1_len/2), center + axis1_vec * (axis1_len/2)
-                        plotter.add_mesh(pv.Line(p_a, p_b), color='red', line_width=3, name=f"FAULTAXIS_{fault_name}_InPlaneMajor")
-                        if fault_name == self.current_fault_name or len(self.faults_data) == 1: legend_entries.append((f"{fault_name} In-Plane Major", "red"))
-
-                    # In-Plane Intermediate Axis (Green)
-                    if len(in_plane_vecs) > 1 and len(in_plane_lengths) > 1:
-                        axis2_vec, axis2_len = in_plane_vecs[1], in_plane_lengths[1]
-                        if axis2_len < 0.01 : axis2_len = 0.1
-                        p_a, p_b = center - axis2_vec * (axis2_len/2), center + axis2_vec * (axis2_len/2)
-                        plotter.add_mesh(pv.Line(p_a, p_b), color='green', line_width=3, name=f"FAULTAXIS_{fault_name}_InPlaneInter")
-                        if fault_name == self.current_fault_name or len(self.faults_data) == 1: legend_entries.append((f"{fault_name} In-Plane Inter.", "green"))
-
-                    # Plane Normal Axis (Blue)
-                    norm_len_vis = minor_axis_len if minor_axis_len > 0.01 else 0.1
-                    p_a_norm, p_b_norm = center - normal_vec * (norm_len_vis/2), center + normal_vec * (norm_len_vis/2)
-                    plotter.add_mesh(pv.Line(p_a_norm, p_b_norm), color='blue', line_width=3, name=f"FAULTAXIS_{fault_name}_PlaneNormal")
-                    if fault_name == self.current_fault_name or len(self.faults_data) == 1: legend_entries.append((f"{fault_name} Plane Normal", "blue"))
-                    
-                    sphere_radius = np.mean(in_plane_lengths) * 0.01 if len(in_plane_lengths) > 0 and np.mean(in_plane_lengths) > 0 else 0.1
-                    if sphere_radius < 0.01: sphere_radius = 0.1
-                    plotter.add_mesh(pv.Sphere(radius=sphere_radius, center=center), color='yellow', name=f'FAULTAXIS_{fault_name}_CenterMarker')
-                # else: self.log_status(f"Planar fit data incomplete for axes widget for {fault_name}.")
-            
-            elif fault_data.get('pca_center') is not None and \
-                 fault_data.get('pca_components') is not None and \
-                 fault_data.get('pca_extents') is not None: # Original PCA path
-                
-                center = fault_data['pca_center']
-                pc_vectors = fault_data['pca_components'] 
-                pc_lengths = fault_data['pca_extents']   
-
-                colors = ['darkred', 'darkgreen', 'darkblue'] # Darker for PCA to distinguish from planar fit axes if shown together
-                labels_base = ['PC1', 'PC2', 'PC3']
-
-                max_overall_extent = np.max(pc_lengths) if pc_lengths.size > 0 and np.max(pc_lengths) > 1e-6 else 1.0
-                for i in range(3):
-                    vec, length = pc_vectors[i], pc_lengths[i]
-                    MIN_LINE_LENGTH_FRACTION, FALLBACK_MIN_LENGTH = 0.02, 0.1
-                    min_visual_length = max(max_overall_extent * MIN_LINE_LENGTH_FRACTION, FALLBACK_MIN_LENGTH / 10.0) if max_overall_extent > 1e-6 else FALLBACK_MIN_LENGTH
-                    if length < min_visual_length: length = min_visual_length
-                                    
-                    p_a, p_b = center - vec * (length/2), center + vec * (length/2)
-                    plotter.add_mesh(pv.Line(p_a, p_b), color=colors[i], line_width=3, name=f"FAULTAXIS_{fault_name}_{labels_base[i]}")
-                    if fault_name == self.current_fault_name or len(self.faults_data) == 1: legend_entries.append((f"{fault_name} {labels_base[i]}", colors[i]))
-                
-                min_ext_for_sphere = np.min(pc_lengths[pc_lengths > 1e-6]) if np.any(pc_lengths > 1e-6) else 1.0
-                sphere_radius = min_ext_for_sphere * 0.05 
-                if sphere_radius < 0.01: sphere_radius = np.mean(pc_lengths[pc_lengths > 1e-6]) * 0.01 if np.any(pc_lengths > 1e-6) else 0.1
-                if sphere_radius < 0.01: sphere_radius = 0.1 
-                plotter.add_mesh(pv.Sphere(radius=sphere_radius, center=center), color='gold', name=f'FAULTAXIS_{fault_name}_PCACenterMarker')
-            # else: self.log_status(f"Fault geometry data (PCA or Planar) not available for {fault_name} for axes widget.")
+                # Add center marker
+                sphere_radius = np.mean(lengths) * 0.02
+                if sphere_radius < 0.01:
+                    sphere_radius = 0.1
+                plotter.add_mesh(pv.Sphere(radius=sphere_radius, center=center),
+                               color='yellow', name=f'FAULTAXIS_{fault_name}_CenterMarker')
 
         if legend_entries:
             plotter.add_legend(labels=legend_entries, bcolor='white', face='triangle')
-        # self.log_status(f"Fault axes widgets updated for {len(self.faults_data)} faults.")
 
     def load_fault_vtk(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Load Fault VTK/VTP", "", "VTK Files (*.vtk *.vtp)")
         if file_path:
-            default_name = file_path.split('/')[-1].split('.')[0] # Default to filename without extension
+            default_name = file_path.split('/')[-1].split('.')[0]
             fault_name, ok = QInputDialog.getText(self, "Fault Name", "Enter a unique name for this fault:", text=default_name)
             
             if not ok or not fault_name:
@@ -367,148 +623,46 @@ class LoopStructuralMiniGui(QMainWindow):
 
             try:
                 polydata = pv.read(file_path)
-                self.log_status(f"Fault data '{fault_name}' loaded: {file_path}. Points: {polydata.n_points}")
+                initial_center, initial_axes, initial_lengths = compute_geometric_features(polydata)
                 
-                current_fault_entry = {'polydata': polydata}
+                current_fault_entry = {
+                    'polydata': polydata,
+                    'initial_center': initial_center.copy(),
+                    'initial_axes': initial_axes.copy(), 
+                    'initial_lengths': initial_lengths.copy(),
+                    'center': initial_center.copy(),
+                    'axes': initial_axes.copy(), 
+                    'lengths': initial_lengths.copy(),
+                    'gui_center_x': f"{initial_center[0]:.2f}",
+                    'gui_center_y': f"{initial_center[1]:.2f}",
+                    'gui_center_z': f"{initial_center[2]:.2f}",
+                    'gui_major_axis': f"{initial_lengths[0]:.2f}",
+                    'gui_intermediate_axis': f"{initial_lengths[1]:.2f}",
+                    'gui_minor_axis': f"{initial_lengths[2]:.2f}",
+                    'gui_displacement': "1", 'gui_nelements': "1000",
+                    'gui_interpolator_type': "PLI", 'gui_fault_buffer': "0.5"
+                }
                 self.faults_data[fault_name] = current_fault_entry
-                self.current_fault_name = fault_name # Make the newly loaded fault current
-
-                points = polydata.points
-                current_fault_entry['is_planar_fit'] = False # Reset flag
-                # Initialize all possible geometry keys to None for this fault
-                for key in ['pca_center', 'pca_components', 'pca_extents', 
-                            'plane_center', 'plane_normal', 'in_plane_axes_vectors', 
-                            'in_plane_axes_lengths', 'planar_minor_axis_length']:
-                    current_fault_entry[key] = None
-
-                if points.shape[0] == 0:
-                    self.log_status(f"ERROR: Fault '{fault_name}' VTK contains no points.")
-                    # Clean up entry if error
-                    del self.faults_data[fault_name]
-                    if self.current_fault_name == fault_name: self.current_fault_name = None
-                    return
-
-                calculated_center = np.mean(points, axis=0)
-                # Store center for both potential cases initially, associated with this fault
-                current_fault_entry['plane_center'] = calculated_center 
-                current_fault_entry['pca_center'] = calculated_center
+                # self.current_fault_name = fault_name # Set by on_fault_selection_changed via setCurrentRow
                 
-                # Store text representations for GUI update
-                current_fault_entry['gui_center_x'] = f"{calculated_center[0]:.2f}"
-                current_fault_entry['gui_center_y'] = f"{calculated_center[1]:.2f}"
-                current_fault_entry['gui_center_z'] = f"{calculated_center[2]:.2f}"
+                self.log_status(f"Fault data '{fault_name}' loaded: {file_path}. Points: {polydata.n_points}")
+                self.log_status(f"Geometric analysis for '{fault_name}':")
+                self.log_status(f"  Initial Center: {initial_center}")
+                self.log_status(f"  Initial Lengths (Maj,Int,Min): {initial_lengths}")
 
-                if points.shape[0] >= 10: # Use PCA for 10 or more points
-                    current_fault_entry['is_planar_fit'] = False
-                    self.log_status(f"Using PCA for fault '{fault_name}' geometry (>= 10 points).")
-                    pca = PCA(n_components=3)
-                    pca.fit(points)
-                    actual_axis_lengths_along_pcs = np.ptp(pca.transform(points), axis=0)
-                    
-                    sorted_geometric_lengths = np.sort(actual_axis_lengths_along_pcs)[::-1]
-                    L_major, L_intermediate, L_minor = sorted_geometric_lengths[0], sorted_geometric_lengths[1], sorted_geometric_lengths[2]
-                    
-                    current_fault_entry['gui_major_axis'] = f"{L_major:.2f}"
-                    current_fault_entry['gui_minor_axis'] = f"{L_minor:.2f}"
-                    current_fault_entry['gui_intermediate_axis'] = f"{L_intermediate:.2f}"
-                    
-                    current_fault_entry['pca_components'] = pca.components_
-                    current_fault_entry['pca_extents'] = actual_axis_lengths_along_pcs
-                    self.log_status(f"PCA ('{fault_name}'): Center {calculated_center}, GeoLengths(Maj,Int,Min): {L_major:.2f},{L_intermediate:.2f},{L_minor:.2f}, PCA Extents: {actual_axis_lengths_along_pcs}")
-
-                else: # Use Planar Fit for < 10 points
-                    current_fault_entry['is_planar_fit'] = True
-                    self.log_status(f"Using Planar Fit for fault '{fault_name}' geometry ({points.shape[0]} points).")
-
-                    if points.shape[0] == 1:
-                        L_major, L_intermediate, L_minor = 0.0, 0.0, 0.0
-                        current_fault_entry['plane_normal'] = np.array([0,0,1])
-                        current_fault_entry['in_plane_axes_vectors'] = [np.array([1,0,0]), np.array([0,1,0])]
-                        current_fault_entry['in_plane_axes_lengths'] = [0.0, 0.0]
-                        current_fault_entry['planar_minor_axis_length'] = 0.0
-                    elif points.shape[0] == 2:
-                        p1, p2 = points[0], points[1]
-                        vec = p2 - p1
-                        L_major = np.linalg.norm(vec)
-                        L_intermediate, L_minor = 0.0, 0.0
-                        plane_normal_val = np.array([1,0,0]) # Default
-                        if np.abs(vec[0]) > 1e-6 or np.abs(vec[1]) > 1e-6:
-                            plane_normal_val = np.cross(vec, np.array([0,0,1]))
-                        if np.linalg.norm(plane_normal_val) < 1e-6: 
-                             plane_normal_val = np.array([1,0,0]) 
-                        plane_normal_val /= np.linalg.norm(plane_normal_val)
-                        current_fault_entry['plane_normal'] = plane_normal_val
-                        
-                        axis1_vec = vec / L_major if L_major > 1e-6 else np.array([1,0,0])
-                        axis2_vec = np.cross(plane_normal_val, axis1_vec)
-                        axis2_vec_norm = np.linalg.norm(axis2_vec)
-                        axis2_vec = axis2_vec / axis2_vec_norm if axis2_vec_norm > 1e-6 else np.array([0,1,0])
-                        current_fault_entry['in_plane_axes_vectors'] = [axis1_vec, axis2_vec]
-                        current_fault_entry['in_plane_axes_lengths'] = [L_major, 0.0]
-                        current_fault_entry['planar_minor_axis_length'] = 0.0
-                    else: # 3 to 9 points
-                        centered_points = points - calculated_center
-                        try:
-                            U, S, Vt = np.linalg.svd(centered_points)
-                            current_fault_entry['plane_normal'] = Vt[-1, :]
-                        except np.linalg.LinAlgError:
-                            self.log_status(f"SVD for planar fit ('{fault_name}') failed. Using default normal.")
-                            current_fault_entry['plane_normal'] = np.array([0,0,1]) 
-
-                        in_plane_axis1_vec = Vt[0, :]
-                        in_plane_axis2_vec = Vt[1, :]
-                        coords_axis1 = centered_points @ in_plane_axis1_vec
-                        coords_axis2 = centered_points @ in_plane_axis2_vec
-                        L_major_in_plane = np.ptp(coords_axis1)
-                        L_intermediate_in_plane = np.ptp(coords_axis2)
-                        
-                        if L_intermediate_in_plane > L_major_in_plane:
-                            L_major_in_plane, L_intermediate_in_plane = L_intermediate_in_plane, L_major_in_plane
-                            in_plane_axis1_vec, in_plane_axis2_vec = in_plane_axis2_vec, in_plane_axis1_vec
-                        
-                        L_minor_val = 0.0 
-                        if S.size >=3 : L_minor_val = S[-1] * 2 
-                        current_fault_entry['in_plane_axes_vectors'] = [in_plane_axis1_vec, in_plane_axis2_vec]
-                        current_fault_entry['in_plane_axes_lengths'] = [L_major_in_plane, L_intermediate_in_plane]
-                        current_fault_entry['planar_minor_axis_length'] = L_minor_val
-                        L_major, L_intermediate, L_minor = L_major_in_plane, L_intermediate_in_plane, L_minor_val
-                    
-                    current_fault_entry['gui_major_axis'] = f"{L_major:.2f}"
-                    current_fault_entry['gui_intermediate_axis'] = f"{L_intermediate:.2f}"
-                    current_fault_entry['gui_minor_axis'] = f"{L_minor:.2f}"
-                    self.log_status(f"PlanarFit ('{fault_name}'): Center {calculated_center}, GeoLengths(Maj,Int,Min): {L_major:.2f},{L_intermediate:.2f},{L_minor:.2f}")
-                    if current_fault_entry['plane_normal'] is not None: self.log_status(f"PlanarFit ('{fault_name}'): Normal {current_fault_entry['plane_normal']}")
-                
-                # Add to list widget and update GUI for the current fault
                 self.fault_list_widget.addItem(fault_name)
-                self.fault_list_widget.setCurrentRow(self.fault_list_widget.count() - 1) # Select the new item
-                self.update_fault_gui_fields(fault_name) # This will populate the QLineEdits
-
-                # Refresh PyVista Plotter
-                self.pyvista_widget.plotter.clear()
-                for name, data_dict in self.faults_data.items():
-                    if 'polydata' in data_dict:
-                        pd_item = data_dict['polydata']
-                        style_args_pv = {'style':'wireframe', 'color':'darkgrey', 'line_width':2, 'name':f"fault_input_{name}"}
-                        if pd_item.n_points <= 10:
-                            style_args_pv = {'style':'points', 'color':'magenta', 'point_size':15, 'name':f"fault_input_points_few_{name}"}
-                            self.pyvista_widget.plotter.add_mesh(pd_item.outline(), color='cyan', name=f"fault_input_bbox_{name}")
-                        self.pyvista_widget.plotter.add_mesh(pd_item, **style_args_pv)
+                self.fault_list_widget.setCurrentRow(self.fault_list_widget.count() - 1) # Triggers selection change
                 
-                if self.strati_polydata: # Strati data is still singular
-                     self.pyvista_widget.plotter.add_mesh(self.strati_polydata, style='points', color='blue', point_size=5, name="strati_input_vtk_points")
-                
-                self._add_fault_axes_widget(self.pyvista_widget.plotter) # This needs to draw axes for ALL faults
-                self.pyvista_widget.plotter.reset_camera()
+                self._update_relationship_table()
 
+                # Visualization is handled by on_fault_selection_changed
             except Exception as e:
                 self.log_status(f"ERROR loading fault VTK for '{fault_name}': {e}")
-                if fault_name in self.faults_data: # Clean up partial entry on error
-                    del self.faults_data[fault_name]
-                # Remove from list widget if added
+                if fault_name in self.faults_data: del self.faults_data[fault_name]
                 items = self.fault_list_widget.findItems(fault_name, Qt.MatchExactly)
                 if items: self.fault_list_widget.takeItem(self.fault_list_widget.row(items[0]))
-                if self.current_fault_name == fault_name: self.current_fault_name = None
+                # if self.current_fault_name == fault_name: self.current_fault_name = None # Handled by selection
+                self._update_relationship_table()
                 import traceback; self.log_status(traceback.format_exc())
 
     def load_strati_vtk(self):
@@ -714,6 +868,55 @@ class LoopStructuralMiniGui(QMainWindow):
             self.log_status(f"ERROR during PyVista visualization: {e}")
             import traceback
             self.log_status(traceback.format_exc())
+
+    def _update_relationship_table(self):
+        self.relationship_table.clear()
+        fault_names = [self.fault_list_widget.item(i).text() for i in range(self.fault_list_widget.count())]
+        num_faults = len(fault_names)
+
+        self.relationship_table.setRowCount(num_faults)
+        self.relationship_table.setColumnCount(num_faults)
+        self.relationship_table.setHorizontalHeaderLabels(fault_names)
+        self.relationship_table.setVerticalHeaderLabels(fault_names)
+
+        for r in range(num_faults):
+            for c in range(num_faults):
+                if r == c:
+                    item = QTableWidgetItem("N/A") # Or leave empty/disabled
+                    item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                    self.relationship_table.setItem(r, c, item)
+                    continue
+
+                fault_r_name = fault_names[r]
+                fault_c_name = fault_names[c]
+
+                combo = QComboBox()
+                combo.addItems(['none', 'abut', 'splay']) # Add other types if needed
+                
+                # Retrieve stored relationship, default to 'none'
+                relationship_type = self.fault_relationships.get((fault_r_name, fault_c_name), 'none')
+                combo.setCurrentText(relationship_type)
+                
+                # Use lambda with default arguments to capture r, c, and fault names correctly
+                combo.currentTextChanged.connect(
+                    lambda text, r_idx=r, c_idx=c, f_r=fault_r_name, f_c=fault_c_name: \
+                    self._on_relationship_changed(text, r_idx, c_idx, f_r, f_c)
+                )
+                self.relationship_table.setCellWidget(r, c, combo)
+        
+        self.relationship_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.relationship_table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+
+    def _on_relationship_changed(self, text_value, row_idx, col_idx, fault_row_name, fault_col_name):
+        relationship_key = (fault_row_name, fault_col_name)
+        if text_value == 'none':
+            if relationship_key in self.fault_relationships:
+                del self.fault_relationships[relationship_key]
+                self.log_status(f"Relationship between {fault_row_name} and {fault_col_name} set to 'none'.")
+        else:
+            self.fault_relationships[relationship_key] = text_value
+            self.log_status(f"Relationship: {fault_row_name} affected by {fault_col_name} as '{text_value}'.")
+        # print(f"Updated relationships: {self.fault_relationships}") # For debugging
 
 
 if __name__ == '__main__':
