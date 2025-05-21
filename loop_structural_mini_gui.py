@@ -3,10 +3,11 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QFileDialog, QGridLayout,
     QComboBox, QTextEdit, QFrame, QCheckBox, QListWidget, QInputDialog,
-    QTableWidget, QTableWidgetItem, QHeaderView, QGroupBox, QMenu
+    QTableWidget, QTableWidgetItem, QHeaderView, QGroupBox, QMenu,
+    QRadioButton, QButtonGroup
 )
 from PySide6.QtCore import Qt, Signal, QPoint
-from PySide6.QtGui import QDoubleValidator, QAction
+from PySide6.QtGui import QDoubleValidator, QAction, QIntValidator
 
 import LoopStructural as LS
 # import LoopStructural.visualisation as vis # No longer used
@@ -21,60 +22,52 @@ from sklearn.decomposition import PCA
 
 def compute_geometric_features(polydata):
     """
-    Compute geometric features using PyVista's OBB (Oriented Bounding Box).
+    Compute geometric features using PCA (Principal Component Analysis).
     Returns center, axes vectors (normalized), and axes lengths.
     """
     if polydata is None or polydata.n_points == 0:
         # Return default values if polydata is invalid
         return np.array([0,0,0]), np.array([[1,0,0],[0,1,0],[0,0,1]]), np.array([0,0,0])
 
-    # Use PyVista's obb() method to get OBB attributes
-    # corner, max_corner, mid_corner, axis0, axis1, axis2, side_lengths
-    try:
-        attrs = polydata.obb(return_polydata=False) 
-        center = np.array(attrs[2])      # mid_corner
-        axes = np.array([attrs[3], attrs[4], attrs[5]]) # axis0, axis1, axis2
-        lengths = np.array(attrs[6])     # side_lengths
-    except Exception as e:
-        print(f"Error computing OBB: {e}. Falling back to PCA-like method.") # Log for debugging
-        # Fallback to a PCA-like method if OBB fails (e.g., for very few points like 1 or 2)
-        points = polydata.points
-        center = np.mean(points, axis=0)
-        if polydata.n_points <= 1: # Not enough points for covariance
-             return center, np.identity(3), np.zeros(3)
+    # Always use PCA-based method for geometric analysis
+    points = polydata.points
+    center = np.mean(points, axis=0)
+    
+    if polydata.n_points <= 1: # Not enough points for covariance
+        return center, np.identity(3), np.zeros(3)
 
-        centered_points = points - center
-        if polydata.n_points == 2: # Special handling for 2 points (a line)
-            vec = centered_points[1] - centered_points[0]
-            length1 = np.linalg.norm(vec)
-            axis1 = vec / length1 if length1 > 1e-6 else np.array([1,0,0])
-            # Create two orthogonal axes
-            temp_axis = np.array([0,0,1]) if np.abs(np.dot(axis1, np.array([0,0,1]))) < 0.9 else np.array([0,1,0])
-            axis2 = np.cross(axis1, temp_axis)
-            axis2_norm = np.linalg.norm(axis2)
-            if axis2_norm > 1e-6: axis2 /= axis2_norm
-            else: axis2 = np.array([0,1,0] if axis1[0]!=0 or axis1[2]!=0 else [1,0,0]) # Ensure orthogonality
-            
-            axis3 = np.cross(axis1, axis2)
-            axis3_norm = np.linalg.norm(axis3)
-            if axis3_norm > 1e-6: axis3 /= axis3_norm
-            # Re-orthogonalize axis2 if necessary from axis1 and axis3
-            axis2 = np.cross(axis3, axis1)
-            return center, np.array([axis1, axis2, axis3]), np.array([length1, 0, 0])
-
-        cov_matrix = np.cov(centered_points.T)
-        eigenvalues, eigenvectors_cols = np.linalg.eigh(cov_matrix)
+    centered_points = points - center
+    if polydata.n_points == 2: # Special handling for 2 points (a line)
+        vec = centered_points[1] - centered_points[0]
+        length1 = np.linalg.norm(vec)
+        axis1 = vec / length1 if length1 > 1e-6 else np.array([1,0,0])
+        # Create two orthogonal axes
+        temp_axis = np.array([0,0,1]) if np.abs(np.dot(axis1, np.array([0,0,1]))) < 0.9 else np.array([0,1,0])
+        axis2 = np.cross(axis1, temp_axis)
+        axis2_norm = np.linalg.norm(axis2)
+        if axis2_norm > 1e-6: axis2 /= axis2_norm
+        else: axis2 = np.array([0,1,0] if axis1[0]!=0 or axis1[2]!=0 else [1,0,0]) # Ensure orthogonality
         
-        # Sort by eigenvalues in descending order
-        sort_idx = np.argsort(eigenvalues)[::-1]
-        # eigenvalues = eigenvalues[sort_idx] # Not directly used for lengths anymore
-        axes = eigenvectors_cols[:, sort_idx].T # Transpose to get axes as rows
-        
-        # Compute lengths based on point cloud extents along these axes
-        projected_coords = centered_points @ axes.T
-        lengths = np.ptp(projected_coords, axis=0)
+        axis3 = np.cross(axis1, axis2)
+        axis3_norm = np.linalg.norm(axis3)
+        if axis3_norm > 1e-6: axis3 /= axis3_norm
+        # Re-orthogonalize axis2 if necessary from axis1 and axis3
+        axis2 = np.cross(axis3, axis1)
+        return center, np.array([axis1, axis2, axis3]), np.array([length1, 0, 0])
 
-    # Ensure axes are normalized (vtkOBBTree axes might not be, though lengths are given)
+    # Calculate covariance matrix
+    cov_matrix = np.cov(centered_points.T)
+    eigenvalues, eigenvectors_cols = np.linalg.eigh(cov_matrix)
+    
+    # Sort by eigenvalues in descending order
+    sort_idx = np.argsort(eigenvalues)[::-1]
+    axes = eigenvectors_cols[:, sort_idx].T # Transpose to get axes as rows
+    
+    # Compute lengths based on point cloud extents along these axes
+    projected_coords = centered_points @ axes.T
+    lengths = np.ptp(projected_coords, axis=0)
+
+    # Ensure axes are normalized
     for i in range(3):
         norm = np.linalg.norm(axes[i])
         if norm > 1e-6:
@@ -83,8 +76,7 @@ def compute_geometric_features(polydata):
             default_axes = np.identity(3)
             axes[i] = default_axes[i]
 
-    # Sort axes by length (descending) as OBB might not guarantee this order strictly
-    # or if we fell back to PCA where eigenvalues determine order, but lengths from ptp might differ.
+    # Sort axes by length (descending)
     sort_idx = np.argsort(lengths)[::-1]
     axes = axes[sort_idx]
     lengths = lengths[sort_idx]
@@ -241,6 +233,43 @@ class LoopStructuralMiniGui(QMainWindow):
         self.fault_buffer_edit = QLineEdit("0.5"); self.fault_buffer_edit.setValidator(self.double_validator)
         self.fault_buffer_edit.editingFinished.connect(self.on_fault_parameter_changed)
         param_grid_layout.addWidget(self.fault_buffer_edit, current_row, 3); current_row +=1
+        
+        # Add Slip Vector section header
+        param_grid_layout.addWidget(QLabel("<b>--- Slip Vector ---</b>"), current_row, 0, 1, 4, Qt.AlignCenter); current_row += 1
+        
+        # Trend input
+        param_grid_layout.addWidget(QLabel("Trend (°):"), current_row, 0)
+        self.fault_trend_edit = QLineEdit("90")  # Default 90 degrees
+        self.fault_trend_edit.setValidator(QIntValidator(0, 360))  # Integer between 0-360 degrees
+        self.fault_trend_edit.editingFinished.connect(self.on_slip_vector_changed)
+        param_grid_layout.addWidget(self.fault_trend_edit, current_row, 1)
+        
+        # Plunge input
+        param_grid_layout.addWidget(QLabel("Plunge (°):"), current_row, 2)
+        self.fault_plunge_edit = QLineEdit("30")  # Default 30 degrees
+        self.fault_plunge_edit.setValidator(QIntValidator(-90, 90))  # Integer between -90 to 90 degrees
+        self.fault_plunge_edit.editingFinished.connect(self.on_slip_vector_changed)
+        param_grid_layout.addWidget(self.fault_plunge_edit, current_row, 3); current_row += 1
+        
+        # Slip type radio buttons (normal/reverse)
+        param_grid_layout.addWidget(QLabel("Slip Type:"), current_row, 0)
+        slip_type_layout = QHBoxLayout()
+        
+        self.normal_radio = QRadioButton("Normal")
+        self.reverse_radio = QRadioButton("Reverse")
+        self.slip_type_group = QButtonGroup()
+        self.slip_type_group.addButton(self.normal_radio, 0)
+        self.slip_type_group.addButton(self.reverse_radio, 1)
+        self.normal_radio.setChecked(True)  # Default to "Normal"
+        
+        slip_type_layout.addWidget(self.normal_radio)
+        slip_type_layout.addWidget(self.reverse_radio)
+        slip_type_layout.addStretch(1)
+        
+        # Connect the radio button group to a handler
+        self.slip_type_group.buttonClicked.connect(self.on_slip_type_changed)
+        
+        param_grid_layout.addLayout(slip_type_layout, current_row, 1, 1, 3); current_row += 1
         
         # Foliation Parameters
         param_grid_layout.addWidget(QLabel("<b>--- Foliation Parameters ('strati') ---</b>"), current_row, 0, 1, 4, Qt.AlignCenter); current_row +=1
@@ -399,6 +428,15 @@ class LoopStructuralMiniGui(QMainWindow):
             self.fault_interpolator_combo.setCurrentText(fault_data.get('gui_interpolator_type', "PLI"))
             self.fault_buffer_edit.setText(fault_data.get('gui_fault_buffer', "0.5"))
 
+            # Update slip vector fields
+            self.fault_trend_edit.setText(fault_data.get('gui_trend', "90"))
+            self.fault_plunge_edit.setText(fault_data.get('gui_plunge', "30"))
+            slip_type = fault_data.get('gui_slip_type', "normal")
+            if slip_type == "normal":
+                self.normal_radio.setChecked(True)
+            else:
+                self.reverse_radio.setChecked(True)
+
             is_overriding = self.override_fault_geom_checkbox.isChecked()
             self.fault_center_x_edit.setReadOnly(not is_overriding)
             self.fault_center_y_edit.setReadOnly(not is_overriding)
@@ -417,6 +455,11 @@ class LoopStructuralMiniGui(QMainWindow):
             self.fault_interpolator_combo.setCurrentText("PLI")
             self.fault_buffer_edit.setText("0.5")
             self.reset_geom_button.setEnabled(False)
+
+            # Clear slip vector fields with defaults
+            self.fault_trend_edit.setText("90")
+            self.fault_plunge_edit.setText("30")
+            self.normal_radio.setChecked(True)
 
     def toggle_fault_geom_fields(self, state):
         is_editable = (state == Qt.Checked)
@@ -509,6 +552,12 @@ class LoopStructuralMiniGui(QMainWindow):
             fault_data['gui_interpolator_type'] = self.fault_interpolator_combo.currentText()
             fault_data['gui_fault_buffer'] = self.fault_buffer_edit.text()
             
+            # Update slip vector parameters
+            fault_data['gui_trend'] = self.fault_trend_edit.text()
+            fault_data['gui_plunge'] = self.fault_plunge_edit.text()
+            slip_type = "normal" if self.normal_radio.isChecked() else "reverse"
+            fault_data['gui_slip_type'] = slip_type
+            
             # Log the change. No direct visualization update is tied to these specific parameters.
             # Find out which widget sent the signal for a more specific log message (optional)
             sender = self.sender()
@@ -517,6 +566,8 @@ class LoopStructuralMiniGui(QMainWindow):
             elif sender == self.fault_nelements_edit: param_name = "Nelements"
             elif sender == self.fault_interpolator_combo: param_name = "Interpolator Type"
             elif sender == self.fault_buffer_edit: param_name = "Fault Buffer"
+            elif sender == self.fault_trend_edit: param_name = "Trend"
+            elif sender == self.fault_plunge_edit: param_name = "Plunge"
 
             self.log_status(f"Fault '{self.current_fault_name}' parameter '{param_name}' updated in GUI.")
 
@@ -604,6 +655,47 @@ class LoopStructuralMiniGui(QMainWindow):
                 plotter.add_mesh(pv.Sphere(radius=sphere_radius, center=center),
                                color='yellow', name=f'FAULTAXIS_{fault_name}_CenterMarker')
 
+                # Now add slip vector visualization
+                try:
+                    # Get slip vector parameters
+                    trend = float(fault_data.get('gui_trend', 90))
+                    plunge = float(fault_data.get('gui_plunge', 30))
+                    slip_type = fault_data.get('gui_slip_type', 'normal')
+                    
+                    # Convert trend/plunge to 3D vector
+                    slip_vec = self.trend_plunge_to_vector(trend, plunge)
+                    
+                    # Reverse the vector if it's a reverse fault
+                    if slip_type == 'reverse':
+                        slip_vec = -slip_vec
+                    
+                    # Scale the slip vector for visualization (relative to fault size)
+                    arrow_length = max(lengths) * 0.5  # Half the length of the longest axis
+                    
+                    # Create start and end points for the arrow
+                    start_point = center.copy()
+                    end_point = start_point + slip_vec * arrow_length
+                    
+                    # Color based on fault type
+                    slip_color = 'blue' if slip_type == 'normal' else 'red'
+                    
+                    # Add the arrow using PyVista's arrow function
+                    slip_arrow = pv.Arrow(start=start_point, direction=slip_vec, 
+                                         tip_length=0.2, shaft_resolution=20,
+                                         tip_resolution=20, scale=arrow_length)
+                    
+                    plotter.add_mesh(slip_arrow, color=slip_color, 
+                                   name=f"SLIPVEC_{fault_name}",
+                                   opacity=0.8)
+                    
+                    # Add to legend if this is the current fault
+                    if fault_name == self.current_fault_name or len(self.faults_data) == 1:
+                        label_text = f"{fault_name} Slip ({slip_type})"
+                        legend_entries.append((label_text, slip_color))
+                    
+                except Exception as e:
+                    self.log_status(f"Error drawing slip vector: {str(e)}")
+
         if legend_entries:
             plotter.add_legend(labels=legend_entries, bcolor='white', face='triangle')
 
@@ -639,8 +731,14 @@ class LoopStructuralMiniGui(QMainWindow):
                     'gui_major_axis': f"{initial_lengths[0]:.2f}",
                     'gui_intermediate_axis': f"{initial_lengths[1]:.2f}",
                     'gui_minor_axis': f"{initial_lengths[2]:.2f}",
-                    'gui_displacement': "1", 'gui_nelements': "1000",
-                    'gui_interpolator_type': "PLI", 'gui_fault_buffer': "0.5"
+                    'gui_displacement': "1", 
+                    'gui_nelements': "1000",
+                    'gui_interpolator_type': "PLI", 
+                    'gui_fault_buffer': "0.5",
+                    # Add slip vector defaults
+                    'gui_trend': "90",
+                    'gui_plunge': "30",
+                    'gui_slip_type': "normal"
                 }
                 self.faults_data[fault_name] = current_fault_entry
                 # self.current_fault_name = fault_name # Set by on_fault_selection_changed via setCurrentRow
@@ -753,11 +851,27 @@ class LoopStructuralMiniGui(QMainWindow):
                 fault_minor_axis = float(fault_data_item.get('gui_minor_axis', 0))
                 fault_intermediate_axis = float(fault_data_item.get('gui_intermediate_axis', 0))
 
+                # Get slip vector parameters
+                trend_val = int(fault_data_item.get('gui_trend', 90))
+                plunge_val = int(fault_data_item.get('gui_plunge', 30))
+                slip_type = fault_data_item.get('gui_slip_type', 'normal')
+                
+                # Process slip vector based on type (flip for reverse faults)
+                slip_vector = {
+                    'trend': trend_val,
+                    'plunge': plunge_val,
+                    'type': slip_type
+                }
+                
+                # Log the slip vector
+                self.log_status(f"Using slip vector for fault '{fault_name}': trend={trend_val}°, plunge={plunge_val}°, type={slip_type}")
+                
                 fault_params_ls = {
                     'nelements': fault_nelements, 'interpolatortype': fault_interpolator,
                     'fault_buffer': fault_buffer_val, 'fault_center': fault_center_val,
                     'major_axis': fault_major_axis, 'minor_axis': fault_minor_axis,
-                    'intermediate_axis': fault_intermediate_axis, 'points': True
+                    'intermediate_axis': fault_intermediate_axis, 'points': True,
+                    'slip_vector': slip_vector  # Add the slip vector to parameters
                 }
                 if fault_data_item.get('is_planar_fit') and fault_data_item.get('plane_normal') is not None:
                     fault_params_ls['fault_normal_vector'] = fault_data_item['plane_normal']
@@ -918,6 +1032,104 @@ class LoopStructuralMiniGui(QMainWindow):
             self.log_status(f"Relationship: {fault_row_name} affected by {fault_col_name} as '{text_value}'.")
         # print(f"Updated relationships: {self.fault_relationships}") # For debugging
 
+    # New helper method to convert trend/plunge to 3D vector
+    def trend_plunge_to_vector(self, trend, plunge):
+        """
+        Convert trend and plunge (in degrees) to a 3D unit vector.
+        Trend: 0-360 degrees clockwise from North (Y+)
+        Plunge: -90 to 90 degrees, positive downward from horizontal
+        Returns: 3D unit vector [x,y,z]
+        """
+        import math
+        # Convert to radians
+        trend_rad = math.radians(trend)
+        plunge_rad = math.radians(plunge)
+        
+        # Calculate the 3D vector components
+        # Note: In typical geological convention, X is East, Y is North, Z is Up
+        # Trend is measured clockwise from North (Y+)
+        # Plunge is positive downward from horizontal
+        x = math.sin(trend_rad) * math.cos(plunge_rad)
+        y = math.cos(trend_rad) * math.cos(plunge_rad)
+        z = -math.sin(plunge_rad)  # Negative because plunge is positive downward, but Z is positive upward
+        
+        return np.array([x, y, z])
+
+    # Modify the on_slip_type_changed method to update visualization
+    def on_slip_type_changed(self, button):
+        if not self.current_fault_name:
+            return
+            
+        fault_data = self.faults_data.get(self.current_fault_name)
+        if not fault_data:
+            return
+            
+        slip_type = "normal" if button == self.normal_radio else "reverse"
+        fault_data['gui_slip_type'] = slip_type
+        self.log_status(f"Slip type for fault '{self.current_fault_name}' set to {slip_type}")
+        
+        # Update the visualization to reflect the changed slip type
+        self._update_fault_visualization()
+
+    # Method to update visualization after slip vector changes
+    def _update_fault_visualization(self):
+        """Update the PyVista visualization when slip vector parameters change"""
+        if not self.current_fault_name:
+            return
+        
+        # Similar to what we do in on_manual_fault_geom_changed
+        # Clear and redraw all actors to refresh the visualization
+        self.pyvista_widget.plotter.clear_actors()
+        for name, data in self.faults_data.items():
+            if data.get('polydata'):
+                style_args = {'style':'wireframe', 'color':'darkgrey', 'line_width':2, 
+                              'name':f"fault_input_{name}"}
+                if data['polydata'].n_points <= 10:
+                    style_args = {'style':'points', 'color':'magenta', 'point_size':15, 
+                                  'name':f"fault_input_points_few_{name}"}
+                    self.pyvista_widget.plotter.add_mesh(
+                        data['polydata'].outline(), color='cyan', name=f"fault_input_bbox_{name}")
+                self.pyvista_widget.plotter.add_mesh(data['polydata'], **style_args)
+        
+        if self.strati_polydata:
+            self.pyvista_widget.plotter.add_mesh(
+                self.strati_polydata, style='points', color='blue', point_size=5, 
+                name="strati_input_vtk_points")
+        
+        # This will redraw the axes and slip vectors with updated parameters
+        self._add_fault_axes_widget(self.pyvista_widget.plotter)
+        self.pyvista_widget.plotter.render()
+
+    # New handler for slip vector parameter changes (trend, plunge)
+    def on_slip_vector_changed(self):
+        """Handle changes to slip vector parameters and update visualization"""
+        if not self.current_fault_name:
+            return
+        
+        fault_data = self.faults_data.get(self.current_fault_name)
+        if not fault_data:
+            return
+        
+        try:
+            # Update the fault data with new values from GUI
+            fault_data['gui_trend'] = self.fault_trend_edit.text()
+            fault_data['gui_plunge'] = self.fault_plunge_edit.text()
+            
+            # Get the sender widget for logging
+            sender = self.sender()
+            param_name = "Unknown"
+            if sender == self.fault_trend_edit: param_name = "Trend"
+            elif sender == self.fault_plunge_edit: param_name = "Plunge"
+            
+            self.log_status(f"Fault '{self.current_fault_name}' slip vector '{param_name}' updated in GUI.")
+            
+            # Update visualization to reflect the changes
+            self._update_fault_visualization()
+            
+        except Exception as e:
+            self.log_status(f"ERROR during slip vector parameter update: {e}")
+            import traceback
+            self.log_status(traceback.format_exc())
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
