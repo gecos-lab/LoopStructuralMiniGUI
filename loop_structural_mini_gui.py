@@ -237,39 +237,32 @@ class LoopStructuralMiniGui(QMainWindow):
         # Add Slip Vector section header
         param_grid_layout.addWidget(QLabel("<b>--- Slip Vector ---</b>"), current_row, 0, 1, 4, Qt.AlignCenter); current_row += 1
         
-        # Trend input
-        param_grid_layout.addWidget(QLabel("Trend (°):"), current_row, 0)
-        self.fault_trend_edit = QLineEdit("90")  # Default 90 degrees
-        self.fault_trend_edit.setValidator(QIntValidator(0, 360))  # Integer between 0-360 degrees
-        self.fault_trend_edit.editingFinished.connect(self.on_slip_vector_changed)
-        param_grid_layout.addWidget(self.fault_trend_edit, current_row, 1)
+        # Rake input (angle from intermediate axis on fault plane)
+        param_grid_layout.addWidget(QLabel("Rake (°):"), current_row, 0)
+        self.fault_rake_edit = QLineEdit("0")  # Default 0 degrees (along intermediate axis)
+        self.fault_rake_edit.setValidator(QIntValidator(-180, 180))  # Integer between -180 to 180 degrees
+        self.fault_rake_edit.editingFinished.connect(self.on_slip_vector_changed)
+        param_grid_layout.addWidget(self.fault_rake_edit, current_row, 1)
         
-        # Plunge input
-        param_grid_layout.addWidget(QLabel("Plunge (°):"), current_row, 2)
-        self.fault_plunge_edit = QLineEdit("30")  # Default 30 degrees
-        self.fault_plunge_edit.setValidator(QIntValidator(-90, 90))  # Integer between -90 to 90 degrees
-        self.fault_plunge_edit.editingFinished.connect(self.on_slip_vector_changed)
-        param_grid_layout.addWidget(self.fault_plunge_edit, current_row, 3); current_row += 1
+        # Add explanation label
+        rake_info_label = QLabel("(Angle from strike direction on fault plane)")
+        rake_info_label.setStyleSheet("font-size: 9px; color: gray;")
+        param_grid_layout.addWidget(rake_info_label, current_row, 2, 1, 2); current_row += 1
         
-        # Slip type radio buttons (normal/reverse)
-        param_grid_layout.addWidget(QLabel("Slip Type:"), current_row, 0)
-        slip_type_layout = QHBoxLayout()
+        # Add rake conventions info
+        rake_conventions_label = QLabel("0°=Sinistral, 90°=Reverse, -90°=Normal, ±180°=Dextral")
+        rake_conventions_label.setStyleSheet("font-size: 8px; color: darkblue; font-weight: bold;")
+        param_grid_layout.addWidget(rake_conventions_label, current_row, 0, 1, 4); current_row += 1
         
-        self.normal_radio = QRadioButton("Normal")
-        self.reverse_radio = QRadioButton("Reverse")
-        self.slip_type_group = QButtonGroup()
-        self.slip_type_group.addButton(self.normal_radio, 0)
-        self.slip_type_group.addButton(self.reverse_radio, 1)
-        self.normal_radio.setChecked(True)  # Default to "Normal"
         
-        slip_type_layout.addWidget(self.normal_radio)
-        slip_type_layout.addWidget(self.reverse_radio)
-        slip_type_layout.addStretch(1)
         
-        # Connect the radio button group to a handler
-        self.slip_type_group.buttonClicked.connect(self.on_slip_type_changed)
-        
-        param_grid_layout.addLayout(slip_type_layout, current_row, 1, 1, 3); current_row += 1
+        # Axis Visualization Type
+        param_grid_layout.addWidget(QLabel("Axis Visualization:"), current_row, 0)
+        self.axis_visualization_combo = QComboBox()
+        self.axis_visualization_combo.addItems(["OBB (Wireframe)", "2D Ellipsoid", "3D Ellipsoid"])
+        self.axis_visualization_combo.setCurrentText("OBB (Wireframe)")  # Default to current implementation
+        self.axis_visualization_combo.currentTextChanged.connect(self.on_axis_visualization_changed)
+        param_grid_layout.addWidget(self.axis_visualization_combo, current_row, 1, 1, 3); current_row += 1
         
         # Foliation Parameters
         param_grid_layout.addWidget(QLabel("<b>--- Foliation Parameters ('strati') ---</b>"), current_row, 0, 1, 4, Qt.AlignCenter); current_row +=1
@@ -429,13 +422,11 @@ class LoopStructuralMiniGui(QMainWindow):
             self.fault_buffer_edit.setText(fault_data.get('gui_fault_buffer', "0.5"))
 
             # Update slip vector fields
-            self.fault_trend_edit.setText(fault_data.get('gui_trend', "90"))
-            self.fault_plunge_edit.setText(fault_data.get('gui_plunge', "30"))
-            slip_type = fault_data.get('gui_slip_type', "normal")
-            if slip_type == "normal":
-                self.normal_radio.setChecked(True)
-            else:
-                self.reverse_radio.setChecked(True)
+            self.fault_rake_edit.setText(fault_data.get('gui_rake', "0"))
+
+            # Update axis visualization setting
+            axis_visualization = fault_data.get('gui_axis_visualization', "OBB (Wireframe)")
+            self.axis_visualization_combo.setCurrentText(axis_visualization)
 
             is_overriding = self.override_fault_geom_checkbox.isChecked()
             self.fault_center_x_edit.setReadOnly(not is_overriding)
@@ -457,9 +448,10 @@ class LoopStructuralMiniGui(QMainWindow):
             self.reset_geom_button.setEnabled(False)
 
             # Clear slip vector fields with defaults
-            self.fault_trend_edit.setText("90")
-            self.fault_plunge_edit.setText("30")
-            self.normal_radio.setChecked(True)
+            self.fault_rake_edit.setText("0")
+
+            # Reset axis visualization to default
+            self.axis_visualization_combo.setCurrentText("OBB (Wireframe)")
 
     def toggle_fault_geom_fields(self, state):
         is_editable = (state == Qt.Checked)
@@ -553,10 +545,7 @@ class LoopStructuralMiniGui(QMainWindow):
             fault_data['gui_fault_buffer'] = self.fault_buffer_edit.text()
             
             # Update slip vector parameters
-            fault_data['gui_trend'] = self.fault_trend_edit.text()
-            fault_data['gui_plunge'] = self.fault_plunge_edit.text()
-            slip_type = "normal" if self.normal_radio.isChecked() else "reverse"
-            fault_data['gui_slip_type'] = slip_type
+            fault_data['gui_rake'] = self.fault_rake_edit.text()
             
             # Log the change. No direct visualization update is tied to these specific parameters.
             # Find out which widget sent the signal for a more specific log message (optional)
@@ -566,8 +555,7 @@ class LoopStructuralMiniGui(QMainWindow):
             elif sender == self.fault_nelements_edit: param_name = "Nelements"
             elif sender == self.fault_interpolator_combo: param_name = "Interpolator Type"
             elif sender == self.fault_buffer_edit: param_name = "Fault Buffer"
-            elif sender == self.fault_trend_edit: param_name = "Trend"
-            elif sender == self.fault_plunge_edit: param_name = "Plunge"
+            elif sender == self.fault_rake_edit: param_name = "Rake"
 
             self.log_status(f"Fault '{self.current_fault_name}' parameter '{param_name}' updated in GUI.")
 
@@ -636,17 +624,28 @@ class LoopStructuralMiniGui(QMainWindow):
                 colors = ['red', 'green', 'blue']
                 labels = ['Major', 'Intermediate', 'Minor']
 
-                # Draw axes
-                for i, (axis, length, color, label) in enumerate(zip(axes, lengths, colors, labels)):
-                    # Ensure minimum visible length
-                    vis_length = max(length, np.mean(lengths) * 0.1)
-                    p_a = center - axis * (vis_length/2)
-                    p_b = center + axis * (vis_length/2)
-                    plotter.add_mesh(pv.Line(p_a, p_b), color=color, line_width=3, 
-                                   name=f"FAULTAXIS_{fault_name}_{label}")
-                    
-                    if fault_name == self.current_fault_name or len(self.faults_data) == 1:
-                        legend_entries.append((f"{fault_name} {label}", color))
+                # Get the visualization type for this fault
+                axis_visualization = fault_data.get('gui_axis_visualization', "OBB (Wireframe)")
+
+                # Create an oriented bounding box using all three axes
+                major_axis = axes[0]
+                intermediate_axis = axes[1]
+                minor_axis = axes[2]
+                
+                major_length = max(lengths[0], np.mean(lengths) * 0.1)
+                intermediate_length = max(lengths[1], np.mean(lengths) * 0.1)
+                minor_length = max(lengths[2], np.mean(lengths) * 0.1)
+
+                # Apply the selected visualization method
+                if axis_visualization == "OBB (Wireframe)":
+                    self._create_obb_visualization(plotter, fault_name, center, axes, lengths, 
+                                                 major_length, intermediate_length, minor_length, legend_entries)
+                elif axis_visualization == "2D Ellipsoid":
+                    self._create_2d_ellipsoid_visualization(plotter, fault_name, center, axes, lengths,
+                                                          major_length, intermediate_length, minor_length, legend_entries)
+                elif axis_visualization == "3D Ellipsoid":
+                    self._create_3d_ellipsoid_visualization(plotter, fault_name, center, axes, lengths,
+                                                          major_length, intermediate_length, minor_length, legend_entries)
 
                 # Add center marker
                 sphere_radius = np.mean(lengths) * 0.02
@@ -658,39 +657,89 @@ class LoopStructuralMiniGui(QMainWindow):
                 # Now add slip vector visualization
                 try:
                     # Get slip vector parameters
-                    trend = float(fault_data.get('gui_trend', 90))
-                    plunge = float(fault_data.get('gui_plunge', 30))
-                    slip_type = fault_data.get('gui_slip_type', 'normal')
+                    rake = float(fault_data.get('gui_rake', 0))
                     
-                    # Convert trend/plunge to 3D vector
-                    slip_vec = self.trend_plunge_to_vector(trend, plunge)
-                    
-                    # Reverse the vector if it's a reverse fault
-                    if slip_type == 'reverse':
-                        slip_vec = -slip_vec
+                    # Convert rake to 3D vector (constrained to fault plane)
+                    slip_vec = self.rake_to_vector(rake, fault_name)
                     
                     # Scale the slip vector for visualization (relative to fault size)
                     arrow_length = max(lengths) * 0.5  # Half the length of the longest axis
                     
-                    # Create start and end points for the arrow
+                    # Create start and end points for the arrow shaft
                     start_point = center.copy()
                     end_point = start_point + slip_vec * arrow_length
                     
-                    # Color based on fault type
-                    slip_color = 'blue' if slip_type == 'normal' else 'red'
+                    # Color based on rake angle (geological convention)
+                    if abs(rake) <= 30 or abs(rake) >= 150:  # Strike-slip
+                        slip_color = 'green'
+                    elif rake > 30:  # Reverse/thrust
+                        slip_color = 'red'
+                    else:  # Normal
+                        slip_color = 'blue'
                     
-                    # Add the arrow using PyVista's arrow function
-                    slip_arrow = pv.Arrow(start=start_point, direction=slip_vec, 
-                                         tip_length=0.2, shaft_resolution=20,
-                                         tip_resolution=20, scale=arrow_length)
+                    # Create simple 2D arrow using lines
+                    # Main shaft line
+                    main_line = pv.Line(start_point, end_point)
+                    plotter.add_mesh(main_line, color=slip_color, line_width=4,
+                                   name=f"SLIPVEC_{fault_name}_shaft")
                     
-                    plotter.add_mesh(slip_arrow, color=slip_color, 
-                                   name=f"SLIPVEC_{fault_name}",
-                                   opacity=0.8)
+                    # Create arrowhead using two short lines
+                    arrowhead_length = arrow_length * 0.15  # 15% of arrow length
+                    arrowhead_angle = 25  # degrees
+                    
+                    # Calculate arrowhead directions (in the fault plane)
+                    import math
+                    
+                    # Get two perpendicular vectors in the fault plane for arrowhead
+                    # Use major and intermediate axes as basis
+                    major_axis = axes[0]
+                    intermediate_axis = axes[1]
+                    
+                    # Create arrowhead vectors by rotating the slip vector slightly
+                    angle_rad = math.radians(arrowhead_angle)
+                    cos_a = math.cos(angle_rad)
+                    sin_a = math.sin(angle_rad)
+                    
+                    # Project slip vector onto fault plane basis
+                    slip_major = np.dot(slip_vec, major_axis)
+                    slip_inter = np.dot(slip_vec, intermediate_axis)
+                    
+                    # Create rotated vectors for arrowhead
+                    arrow1_major = slip_major * cos_a - slip_inter * sin_a
+                    arrow1_inter = slip_major * sin_a + slip_inter * cos_a
+                    arrow2_major = slip_major * cos_a + slip_inter * sin_a  
+                    arrow2_inter = -slip_major * sin_a + slip_inter * cos_a
+                    
+                    # Convert back to 3D
+                    arrow1_vec = arrow1_major * major_axis + arrow1_inter * intermediate_axis
+                    arrow2_vec = arrow2_major * major_axis + arrow2_inter * intermediate_axis
+                    
+                    # Normalize and scale
+                    arrow1_vec = arrow1_vec / np.linalg.norm(arrow1_vec) * arrowhead_length
+                    arrow2_vec = arrow2_vec / np.linalg.norm(arrow2_vec) * arrowhead_length
+                    
+                    # Create arrowhead lines (pointing back from tip)
+                    arrowhead1_start = end_point - arrow1_vec
+                    arrowhead2_start = end_point - arrow2_vec
+                    
+                    arrowhead1 = pv.Line(end_point, arrowhead1_start)
+                    arrowhead2 = pv.Line(end_point, arrowhead2_start)
+                    
+                    plotter.add_mesh(arrowhead1, color=slip_color, line_width=4,
+                                   name=f"SLIPVEC_{fault_name}_head1")
+                    plotter.add_mesh(arrowhead2, color=slip_color, line_width=4,
+                                   name=f"SLIPVEC_{fault_name}_head2")
                     
                     # Add to legend if this is the current fault
                     if fault_name == self.current_fault_name or len(self.faults_data) == 1:
-                        label_text = f"{fault_name} Slip ({slip_type})"
+                        # Determine fault type from rake
+                        if abs(rake) <= 30 or abs(rake) >= 150:
+                            fault_type = "Strike-slip"
+                        elif rake > 30:
+                            fault_type = "Reverse"
+                        else:
+                            fault_type = "Normal"
+                        label_text = f"{fault_name} {fault_type} (rake={rake}°)"
                         legend_entries.append((label_text, slip_color))
                     
                 except Exception as e:
@@ -698,6 +747,151 @@ class LoopStructuralMiniGui(QMainWindow):
 
         if legend_entries:
             plotter.add_legend(labels=legend_entries, bcolor='white', face='triangle')
+
+    def _create_obb_visualization(self, plotter, fault_name, center, axes, lengths, 
+                                major_length, intermediate_length, minor_length, legend_entries):
+        """Create Oriented Bounding Box visualization"""
+        try:
+            # Create a unit box centered at origin
+            bbox = pv.Box(bounds=[-0.5, 0.5, -0.5, 0.5, -0.5, 0.5])
+            
+            # Create transformation matrix from the principal axes
+            # Scale the box to match the axis lengths
+            scale_matrix = np.diag([major_length, intermediate_length, minor_length])
+            
+            # Create rotation matrix from the principal axes (each axis is a column)
+            rotation_matrix = np.column_stack([axes[0], axes[1], axes[2]])
+            
+            # Apply scaling then rotation to each point
+            points = bbox.points
+            transformed_points = []
+            
+            for point in points:
+                # Scale the point
+                scaled_point = scale_matrix @ point
+                # Rotate the scaled point
+                rotated_point = rotation_matrix @ scaled_point
+                # Translate to the fault center
+                final_point = rotated_point + center
+                transformed_points.append(final_point)
+            
+            # Create the transformed box
+            oriented_bbox = bbox.copy()
+            oriented_bbox.points = np.array(transformed_points)
+            
+            # Add the oriented bounding box as wireframe
+            plotter.add_mesh(oriented_bbox, style='wireframe', color='orange', 
+                           line_width=3, name=f"FAULTAXIS_{fault_name}_OBB")
+            
+            # Also add a semi-transparent version for better visualization
+            plotter.add_mesh(oriented_bbox, color='orange', opacity=0.2,
+                           name=f"FAULTAXIS_{fault_name}_OBB_Fill")
+            
+            if fault_name == self.current_fault_name or len(self.faults_data) == 1:
+                legend_entries.append((f"{fault_name} OBB", 'orange'))
+                
+        except Exception as e:
+            self.log_status(f"Error creating OBB for {fault_name}: {e}")
+            self._create_fallback_lines(plotter, fault_name, center, axes, lengths, legend_entries)
+
+    def _create_2d_ellipsoid_visualization(self, plotter, fault_name, center, axes, lengths,
+                                         major_length, intermediate_length, minor_length, legend_entries):
+        """Create 2D ellipse in the major-intermediate plane with minor axis line"""
+        try:
+            # Create a parametric ellipse in 2D, then transform to 3D
+            theta = np.linspace(0, 2*np.pi, 50)
+            ellipse_2d = np.column_stack([
+                (major_length/2) * np.cos(theta),
+                (intermediate_length/2) * np.sin(theta),
+                np.zeros_like(theta)
+            ])
+            
+            # Create transformation matrix from axes
+            transform_matrix = np.column_stack([axes[0], axes[1], axes[2]])
+            
+            # Transform ellipse points to 3D using the fault axes
+            ellipse_3d = ellipse_2d @ transform_matrix.T + center
+            
+            # Create a polygon from the ellipse points
+            ellipse_polydata = pv.PolyData(ellipse_3d)
+            faces = []
+            n_points = len(ellipse_3d)
+            for i in range(n_points):
+                faces.extend([3, i, (i+1) % n_points, 0])  # Triangle fan from center
+            
+            # Add center point
+            ellipse_points = np.vstack([center, ellipse_3d])
+            ellipse_polydata = pv.PolyData(ellipse_points, faces)
+            
+            # Add the ellipse to the plotter
+            plotter.add_mesh(ellipse_polydata, color='orange', opacity=0.6, 
+                           name=f"FAULTAXIS_{fault_name}_Ellipse2D")
+            
+            # Draw line for minor axis (perpendicular to ellipse)
+            vis_length = max(minor_length, np.mean(lengths) * 0.1)
+            p_a = center - axes[2] * (vis_length/2)
+            p_b = center + axes[2] * (vis_length/2)
+            plotter.add_mesh(pv.Line(p_a, p_b), color='blue', line_width=3, 
+                           name=f"FAULTAXIS_{fault_name}_MinorAxis")
+            
+            if fault_name == self.current_fault_name or len(self.faults_data) == 1:
+                legend_entries.append((f"{fault_name} 2D Ellipse", 'orange'))
+                legend_entries.append((f"{fault_name} Minor", 'blue'))
+                
+        except Exception as e:
+            self.log_status(f"Error creating 2D ellipse for {fault_name}: {e}")
+            self._create_fallback_lines(plotter, fault_name, center, axes, lengths, legend_entries)
+
+    def _create_3d_ellipsoid_visualization(self, plotter, fault_name, center, axes, lengths,
+                                         major_length, intermediate_length, minor_length, legend_entries):
+        """Create true 3D ellipsoid using all three axes"""
+        try:
+            # Create a parametric ellipsoid
+            ellipsoid = pv.ParametricEllipsoid(xradius=major_length/2, 
+                                             yradius=intermediate_length/2, 
+                                             zradius=minor_length/2)
+            
+            # Create rotation matrix from the principal axes
+            rotation_matrix = np.column_stack([axes[0], axes[1], axes[2]])
+            
+            # Apply rotation to ellipsoid points
+            points = ellipsoid.points
+            rotated_points = []
+            
+            for point in points:
+                rotated_point = rotation_matrix @ point
+                final_point = rotated_point + center
+                rotated_points.append(final_point)
+            
+            # Create the transformed ellipsoid
+            oriented_ellipsoid = ellipsoid.copy()
+            oriented_ellipsoid.points = np.array(rotated_points)
+            
+            # Add the ellipsoid to the plotter
+            plotter.add_mesh(oriented_ellipsoid, color='orange', opacity=0.7,
+                           name=f"FAULTAXIS_{fault_name}_Ellipsoid3D")
+            
+            if fault_name == self.current_fault_name or len(self.faults_data) == 1:
+                legend_entries.append((f"{fault_name} 3D Ellipsoid", 'orange'))
+                
+        except Exception as e:
+            self.log_status(f"Error creating 3D ellipsoid for {fault_name}: {e}")
+            self._create_fallback_lines(plotter, fault_name, center, axes, lengths, legend_entries)
+
+    def _create_fallback_lines(self, plotter, fault_name, center, axes, lengths, legend_entries):
+        """Fallback visualization using simple lines for each axis"""
+        colors = ['red', 'green', 'blue']
+        labels = ['Major', 'Intermediate', 'Minor']
+        
+        for i, (axis, length, color, label) in enumerate(zip(axes, lengths, colors, labels)):
+            vis_length = max(length, np.mean(lengths) * 0.1)
+            p_a = center - axis * (vis_length/2)
+            p_b = center + axis * (vis_length/2)
+            plotter.add_mesh(pv.Line(p_a, p_b), color=color, line_width=3, 
+                           name=f"FAULTAXIS_{fault_name}_{label}")
+            
+            if fault_name == self.current_fault_name or len(self.faults_data) == 1:
+                legend_entries.append((f"{fault_name} {label}", color))
 
     def load_fault_vtk(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Load Fault VTK/VTP", "", "VTK Files (*.vtk *.vtp)")
@@ -736,9 +930,9 @@ class LoopStructuralMiniGui(QMainWindow):
                     'gui_interpolator_type': "PLI", 
                     'gui_fault_buffer': "0.5",
                     # Add slip vector defaults
-                    'gui_trend': "90",
-                    'gui_plunge': "30",
-                    'gui_slip_type': "normal"
+                    'gui_rake': "0",
+                    # Add axis visualization default
+                    'gui_axis_visualization': "OBB (Wireframe)"
                 }
                 self.faults_data[fault_name] = current_fault_entry
                 # self.current_fault_name = fault_name # Set by on_fault_selection_changed via setCurrentRow
@@ -771,10 +965,8 @@ class LoopStructuralMiniGui(QMainWindow):
                 self.log_status(f"Strati data loaded: {file_path}. Points: {self.strati_polydata.n_points}")
                 # Trigger PyVista update
                 self.pyvista_widget.plotter.clear()
-                if self.fault_polydata:
-                    self.pyvista_widget.plotter.add_mesh(self.fault_polydata, style='wireframe', color='darkgrey', line_width=2, name="fault_input_vtk")
-                    self._add_fault_axes_widget(self.pyvista_widget.plotter)
-                self.pyvista_widget.plotter.add_mesh(self.strati_polydata, style='points', color='blue', point_size=5, name="strati_input_vtk_points")
+                if self.strati_polydata:
+                    self.pyvista_widget.plotter.add_mesh(self.strati_polydata, style='points', color='blue', point_size=5, name="strati_input_vtk_points")
                 self.pyvista_widget.plotter.reset_camera()
 
             except Exception as e:
@@ -852,19 +1044,15 @@ class LoopStructuralMiniGui(QMainWindow):
                 fault_intermediate_axis = float(fault_data_item.get('gui_intermediate_axis', 0))
 
                 # Get slip vector parameters
-                trend_val = int(fault_data_item.get('gui_trend', 90))
-                plunge_val = int(fault_data_item.get('gui_plunge', 30))
-                slip_type = fault_data_item.get('gui_slip_type', 'normal')
+                rake = float(fault_data_item.get('gui_rake', 0))
                 
-                # Process slip vector based on type (flip for reverse faults)
+                # Create slip vector dictionary
                 slip_vector = {
-                    'trend': trend_val,
-                    'plunge': plunge_val,
-                    'type': slip_type
+                    'rake': rake
                 }
                 
                 # Log the slip vector
-                self.log_status(f"Using slip vector for fault '{fault_name}': trend={trend_val}°, plunge={plunge_val}°, type={slip_type}")
+                self.log_status(f"Using slip vector for fault '{fault_name}': rake={rake}°")
                 
                 fault_params_ls = {
                     'nelements': fault_nelements, 'interpolatortype': fault_interpolator,
@@ -1032,28 +1220,78 @@ class LoopStructuralMiniGui(QMainWindow):
             self.log_status(f"Relationship: {fault_row_name} affected by {fault_col_name} as '{text_value}'.")
         # print(f"Updated relationships: {self.fault_relationships}") # For debugging
 
-    # New helper method to convert trend/plunge to 3D vector
-    def trend_plunge_to_vector(self, trend, plunge):
+    # New helper method to convert rake to 3D vector
+    def rake_to_vector(self, rake, fault_name=None):
         """
-        Convert trend and plunge (in degrees) to a 3D unit vector.
-        Trend: 0-360 degrees clockwise from North (Y+)
-        Plunge: -90 to 90 degrees, positive downward from horizontal
-        Returns: 3D unit vector [x,y,z]
+        Convert rake (in degrees) to a 3D unit vector constrained to the fault plane.
+        Rake: -180 to 180 degrees measured from major axis (strike direction)
+        on the fault plane defined by major and intermediate axes.
+        
+        Geological conventions:
+        - Major axis: Strike direction (horizontal on fault plane)
+        - Intermediate axis: Dip direction (down-dip on fault plane)  
+        - Minor axis: Fault normal (perpendicular to fault plane)
+        
+        Args:
+            rake: Angle in degrees from strike direction (major axis)
+            fault_name: Name of the fault to get axes from (uses current fault if None)
+        
+        Returns: 3D unit vector [x,y,z] on the fault plane
         """
         import math
-        # Convert to radians
-        trend_rad = math.radians(trend)
-        plunge_rad = math.radians(plunge)
         
-        # Calculate the 3D vector components
-        # Note: In typical geological convention, X is East, Y is North, Z is Up
-        # Trend is measured clockwise from North (Y+)
-        # Plunge is positive downward from horizontal
-        x = math.sin(trend_rad) * math.cos(plunge_rad)
-        y = math.cos(trend_rad) * math.cos(plunge_rad)
-        z = -math.sin(plunge_rad)  # Negative because plunge is positive downward, but Z is positive upward
+        # Get the current fault name if not provided
+        if fault_name is None:
+            fault_name = self.current_fault_name
         
-        return np.array([x, y, z])
+        if not fault_name or fault_name not in self.faults_data:
+            # Fallback to simple calculation if no fault data available
+            rake_rad = math.radians(rake)
+            return np.array([math.cos(rake_rad), math.sin(rake_rad), 0])
+        
+        fault_data = self.faults_data[fault_name]
+        if 'axes' not in fault_data:
+            # Fallback if no axes data
+            rake_rad = math.radians(rake)
+            return np.array([math.cos(rake_rad), math.sin(rake_rad), 0])
+        
+        # Get the principal axes from PCA using correct geological conventions
+        axes = fault_data['axes']
+        major_axis = axes[0]        # Strike direction (horizontal on fault plane)
+        intermediate_axis = axes[1] # Dip direction (down-dip on fault plane)
+        minor_axis = axes[2]        # Normal to fault plane
+        
+        # Convert rake to radians
+        rake_rad = math.radians(rake)
+        
+        # Calculate slip vector on the fault plane
+        # Rake = 0° means along major axis (strike direction) - sinistral
+        # Rake = 90° means along intermediate axis (dip direction) - reverse
+        # Rake = -90° means opposite to intermediate axis (up-dip direction) - normal
+        # Rake = ±180° means opposite to major axis (strike direction) - dextral
+        slip_vector = (math.cos(rake_rad) * major_axis + 
+                      math.sin(rake_rad) * intermediate_axis)
+        
+        # Ensure the vector is normalized
+        norm = np.linalg.norm(slip_vector)
+        if norm > 1e-6:
+            slip_vector = slip_vector / norm
+        else:
+            # Fallback to major axis if something went wrong
+            slip_vector = major_axis / np.linalg.norm(major_axis)
+        
+        # Verify the slip vector is on the fault plane (perpendicular to minor axis)
+        # The dot product with the normal should be close to zero
+        dot_product = np.dot(slip_vector, minor_axis)
+        if abs(dot_product) > 1e-6:
+            # Project the slip vector onto the fault plane to ensure it's on the plane
+            slip_vector = slip_vector - dot_product * minor_axis
+            # Renormalize
+            norm = np.linalg.norm(slip_vector)
+            if norm > 1e-6:
+                slip_vector = slip_vector / norm
+        
+        return slip_vector
 
     # Modify the on_slip_type_changed method to update visualization
     def on_slip_type_changed(self, button):
@@ -1100,7 +1338,7 @@ class LoopStructuralMiniGui(QMainWindow):
         self._add_fault_axes_widget(self.pyvista_widget.plotter)
         self.pyvista_widget.plotter.render()
 
-    # New handler for slip vector parameter changes (trend, plunge)
+    # New handler for slip vector parameter changes (rake)
     def on_slip_vector_changed(self):
         """Handle changes to slip vector parameters and update visualization"""
         if not self.current_fault_name:
@@ -1112,14 +1350,12 @@ class LoopStructuralMiniGui(QMainWindow):
         
         try:
             # Update the fault data with new values from GUI
-            fault_data['gui_trend'] = self.fault_trend_edit.text()
-            fault_data['gui_plunge'] = self.fault_plunge_edit.text()
+            fault_data['gui_rake'] = self.fault_rake_edit.text()
             
             # Get the sender widget for logging
             sender = self.sender()
             param_name = "Unknown"
-            if sender == self.fault_trend_edit: param_name = "Trend"
-            elif sender == self.fault_plunge_edit: param_name = "Plunge"
+            if sender == self.fault_rake_edit: param_name = "Rake"
             
             self.log_status(f"Fault '{self.current_fault_name}' slip vector '{param_name}' updated in GUI.")
             
@@ -1128,6 +1364,31 @@ class LoopStructuralMiniGui(QMainWindow):
             
         except Exception as e:
             self.log_status(f"ERROR during slip vector parameter update: {e}")
+            import traceback
+            self.log_status(traceback.format_exc())
+
+    # New handler for axis visualization type change
+    def on_axis_visualization_changed(self):
+        """Handle changes to axis visualization type and update visualization"""
+        if not self.current_fault_name:
+            return
+        
+        fault_data = self.faults_data.get(self.current_fault_name)
+        if not fault_data:
+            return
+        
+        try:
+            # Update the fault data with new values from GUI
+            axis_visualization = self.axis_visualization_combo.currentText()
+            fault_data['gui_axis_visualization'] = axis_visualization
+            
+            self.log_status(f"Fault '{self.current_fault_name}' axis visualization set to {axis_visualization}")
+            
+            # Update visualization to reflect the changes
+            self._update_fault_visualization()
+            
+        except Exception as e:
+            self.log_status(f"ERROR during axis visualization update: {e}")
             import traceback
             self.log_status(traceback.format_exc())
 
